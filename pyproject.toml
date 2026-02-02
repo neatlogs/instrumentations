@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neatlogs-instrumentations"
+version = "0.1.0"
+description = "Neatlogs OpenTelemetry-compatible instrumentations for AI agent ecosystems."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+authors = [{ name = "Neatlogs" }]
+
+dependencies = [
+  "opentelemetry-api>=1.0",
+  "opentelemetry-instrumentation>=0.40b0",
+  "wrapt>=1.15",
+]
+
+[project.optional-dependencies]
+azure-ai-inference = [
+  "azure-ai-inference>=1.0.0b0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "packages"}
+
+[tool.setuptools.packages.find]
+where = ["packages"]
