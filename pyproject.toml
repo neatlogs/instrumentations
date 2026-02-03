@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neatlogs-instrumentations"
-version = "0.1.0"
+version = "0.1.1"
 description = "Neatlogs OpenTelemetry-compatible instrumentations for AI agent ecosystems."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "Proprietary" }
 authors = [{ name = "Neatlogs" }]
 
