@@ -62,18 +62,23 @@ export class GoogleGenAIInstrumentation extends InstrumentationBase<GoogleGenAII
 
     this._modelsProto = ModelsProto;
 
-    if (ModelsProto.generateContent) {
+    // The @google/genai SDK assigns generateContent and generateContentStream
+    // as instance arrow functions in the Models constructor. These arrow
+    // functions delegate to generateContentInternal / generateContentStreamInternal
+    // which ARE on the prototype. Patching the internal methods means all
+    // instances are automatically instrumented without constructor wrapping.
+    if (typeof ModelsProto.generateContentInternal === 'function') {
       this._wrap(
         ModelsProto,
-        'generateContent',
+        'generateContentInternal',
         this._patchGenerateContent(),
       );
     }
 
-    if (ModelsProto.generateContentStream) {
+    if (typeof ModelsProto.generateContentStreamInternal === 'function') {
       this._wrap(
         ModelsProto,
-        'generateContentStream',
+        'generateContentStreamInternal',
         this._patchGenerateContentStream(),
       );
     }
@@ -81,13 +86,46 @@ export class GoogleGenAIInstrumentation extends InstrumentationBase<GoogleGenAII
 
   private _unpatchModule(): void {
     if (this._modelsProto) {
-      if (this._modelsProto.generateContent) {
-        this._unwrap(this._modelsProto, 'generateContent');
+      if (typeof this._modelsProto.generateContentInternal === 'function') {
+        this._unwrap(this._modelsProto, 'generateContentInternal');
       }
-      if (this._modelsProto.generateContentStream) {
-        this._unwrap(this._modelsProto, 'generateContentStream');
+      if (typeof this._modelsProto.generateContentStreamInternal === 'function') {
+        this._unwrap(this._modelsProto, 'generateContentStreamInternal');
       }
       this._modelsProto = null;
+    }
+  }
+
+  /**
+   * Set common request attributes on a span (shared between generate and stream).
+   */
+  private _setCommonRequestAttributes(
+    span: Span,
+    model: string,
+    contents: any[],
+    request: any,
+  ): void {
+    span.setAttribute('openinference.span.kind', 'LLM');
+    span.setAttribute('gen_ai.system', 'google_genai');
+    span.setAttribute('gen_ai.request.model', model);
+    span.setAttribute('llm.model_name', model);
+
+    setInputMessageAttributes(span, contents);
+
+    if (request.config) {
+      const config = request.config;
+      if (config.temperature !== undefined) {
+        span.setAttribute('gen_ai.request.temperature', config.temperature);
+      }
+      if (config.maxOutputTokens !== undefined) {
+        span.setAttribute('gen_ai.request.max_tokens', config.maxOutputTokens);
+      }
+      if (config.topP !== undefined) {
+        span.setAttribute('gen_ai.request.top_p', config.topP);
+      }
+      if (config.topK !== undefined) {
+        span.setAttribute('gen_ai.request.top_k', config.topK);
+      }
     }
   }
 
@@ -108,34 +146,12 @@ export class GoogleGenAIInstrumentation extends InstrumentationBase<GoogleGenAII
           { kind: SpanKind.CLIENT },
           async (span: Span) => {
             try {
-              span.setAttribute('openinference.span.kind', 'LLM');
-              span.setAttribute('gen_ai.system', 'google_genai');
-              span.setAttribute('gen_ai.request.model', model);
-              span.setAttribute('llm.model_name', model);
-
-              setInputMessageAttributes(span, contents);
-
-              if (request.config) {
-                const config = request.config;
-                if (config.temperature !== undefined) {
-                  span.setAttribute(
-                    'gen_ai.request.temperature',
-                    config.temperature,
-                  );
-                }
-                if (config.maxOutputTokens !== undefined) {
-                  span.setAttribute(
-                    'gen_ai.request.max_tokens',
-                    config.maxOutputTokens,
-                  );
-                }
-                if (config.topP !== undefined) {
-                  span.setAttribute('gen_ai.request.top_p', config.topP);
-                }
-                if (config.topK !== undefined) {
-                  span.setAttribute('gen_ai.request.top_k', config.topK);
-                }
-              }
+              instrumentation._setCommonRequestAttributes(
+                span,
+                model,
+                contents,
+                request,
+              );
 
               const result = await original.apply(this, args);
 
@@ -175,34 +191,12 @@ export class GoogleGenAIInstrumentation extends InstrumentationBase<GoogleGenAII
           { kind: SpanKind.CLIENT },
           async (span: Span) => {
             try {
-              span.setAttribute('openinference.span.kind', 'LLM');
-              span.setAttribute('gen_ai.system', 'google_genai');
-              span.setAttribute('gen_ai.request.model', model);
-              span.setAttribute('llm.model_name', model);
-
-              setInputMessageAttributes(span, contents);
-
-              if (request.config) {
-                const config = request.config;
-                if (config.temperature !== undefined) {
-                  span.setAttribute(
-                    'gen_ai.request.temperature',
-                    config.temperature,
-                  );
-                }
-                if (config.maxOutputTokens !== undefined) {
-                  span.setAttribute(
-                    'gen_ai.request.max_tokens',
-                    config.maxOutputTokens,
-                  );
-                }
-                if (config.topP !== undefined) {
-                  span.setAttribute('gen_ai.request.top_p', config.topP);
-                }
-                if (config.topK !== undefined) {
-                  span.setAttribute('gen_ai.request.top_k', config.topK);
-                }
-              }
+              instrumentation._setCommonRequestAttributes(
+                span,
+                model,
+                contents,
+                request,
+              );
 
               const streamResult = await original.apply(this, args);
 
@@ -222,9 +216,17 @@ export class GoogleGenAIInstrumentation extends InstrumentationBase<GoogleGenAII
     };
   }
 
-  private _wrapStream(span: Span, streamResult: any): any {
+  private _wrapStream(span: Span, originalStream: any): any {
     const chunks: any[] = [];
-    const originalStream = streamResult;
+    let ended = false;
+
+    const endSpan = () => {
+      if (ended) return;
+      ended = true;
+      finalizeStreamAttributes(span, chunks);
+      span.setStatus({ code: SpanStatusCode.OK });
+      span.end();
+    };
 
     const wrappedStream = {
       [Symbol.asyncIterator]() {
@@ -237,25 +239,24 @@ export class GoogleGenAIInstrumentation extends InstrumentationBase<GoogleGenAII
                 chunks.push(result.value);
               }
               if (result.done) {
-                finalizeStreamAttributes(span, chunks);
-                span.setStatus({ code: SpanStatusCode.OK });
-                span.end();
+                endSpan();
               }
               return result;
             } catch (error: any) {
-              span.setStatus({
-                code: SpanStatusCode.ERROR,
-                message: error?.message,
-              });
-              span.recordException(error);
-              span.end();
+              if (!ended) {
+                ended = true;
+                span.setStatus({
+                  code: SpanStatusCode.ERROR,
+                  message: error?.message,
+                });
+                span.recordException(error);
+                span.end();
+              }
               throw error;
             }
           },
           async return(value?: any) {
-            finalizeStreamAttributes(span, chunks);
-            span.setStatus({ code: SpanStatusCode.OK });
-            span.end();
+            endSpan();
             return iterator.return?.(value) ?? { done: true as const, value };
           },
         };

@@ -1,19 +1,32 @@
 import type { Span } from '@opentelemetry/api';
 
+const DEFAULT_MAX_LENGTH = 10000;
+
 /**
  * Safely stringify an object to JSON with truncation.
- * Returns '{}' if serialization fails.
+ * Returns empty string on error or if `JSON.stringify` returns `undefined`.
  */
-export function safeJsonStringify(obj: any, maxLength: number = 10000): string {
+export function safeJsonStringify(obj: any, maxLength: number = DEFAULT_MAX_LENGTH): string {
   try {
-    const json = JSON.stringify(obj);
-    if (json.length > maxLength) {
-      return json.substring(0, maxLength);
+    const str = JSON.stringify(obj);
+    if (str && str.length > maxLength) {
+      return str.substring(0, maxLength);
     }
-    return json;
+    return str ?? '';
   } catch {
-    return '{}';
+    return '';
   }
+}
+
+/**
+ * Extract concatenated text from an array of content parts.
+ * Filters to parts that have a `text` property and joins them.
+ */
+export function extractTextFromParts(parts: any[]): string {
+  return parts
+    .filter((p: any) => p.text)
+    .map((p: any) => p.text)
+    .join('');
 }
 
 /**
@@ -28,10 +41,7 @@ export function setInputMessageAttributes(span: Span, contents: any[]): void {
       const role = content.role || 'user';
       span.setAttribute(`llm.input_messages.${i}.message.role`, role);
       if (content.parts) {
-        const textParts = content.parts
-          .filter((p: any) => p.text)
-          .map((p: any) => p.text)
-          .join('');
+        const textParts = extractTextFromParts(content.parts);
         if (textParts) {
           span.setAttribute(
             `llm.input_messages.${i}.message.content`,
@@ -55,10 +65,7 @@ export function setOutputAttributes(span: Span, result: any): void {
     if (result.candidates?.[0]) {
       const candidate = result.candidates[0];
       if (candidate.content?.parts) {
-        const text = candidate.content.parts
-          .filter((p: any) => p.text)
-          .map((p: any) => p.text)
-          .join('');
+        const text = extractTextFromParts(candidate.content.parts);
         span.setAttribute(
           'llm.output_messages.0.message.role',
           candidate.content.role || 'model',
@@ -125,11 +132,11 @@ export function finalizeStreamAttributes(span: Span, chunks: any[]): void {
       }
       if (chunk.usageMetadata) {
         totalPromptTokens =
-          chunk.usageMetadata.promptTokenCount || totalPromptTokens;
+          chunk.usageMetadata.promptTokenCount ?? totalPromptTokens;
         totalCompletionTokens =
-          chunk.usageMetadata.candidatesTokenCount || totalCompletionTokens;
+          chunk.usageMetadata.candidatesTokenCount ?? totalCompletionTokens;
         totalTokens =
-          chunk.usageMetadata.totalTokenCount || totalTokens;
+          chunk.usageMetadata.totalTokenCount ?? totalTokens;
       }
     }
 

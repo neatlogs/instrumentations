@@ -1,6 +1,7 @@
 import {
   InstrumentationBase,
   InstrumentationNodeModuleDefinition,
+  InstrumentationNodeModuleFile,
 } from '@opentelemetry/instrumentation';
 import {
   trace,
@@ -17,16 +18,16 @@ import {
   safeJsonStringify,
 } from './attributes.js';
 
-const instrumentationName = '@neatlogs/instrumentation-mastra';
-const instrumentationVersion = '0.1.0';
+const INSTRUMENTATION_NAME = '@neatlogs/instrumentation-mastra';
+const INSTRUMENTATION_VERSION = '0.1.0';
 
 export class MastraInstrumentation extends InstrumentationBase<MastraInstrumentationConfig> {
-  private _agentPrototype: any;
-  private _workflowPrototype: any;
-  private _originalCreateTool: any;
+  private _agentPrototype: any = null;
+  private _workflowPrototype: any = null;
+  private _originalCreateTool: any = null;
 
   constructor(config: MastraInstrumentationConfig = {}) {
-    super(instrumentationName, instrumentationVersion, config);
+    super(INSTRUMENTATION_NAME, INSTRUMENTATION_VERSION, config);
   }
 
   /**
@@ -36,12 +37,14 @@ export class MastraInstrumentation extends InstrumentationBase<MastraInstrumenta
    */
   private async _getOrCreateSpan<T>(
     spanName: string,
-    fn: (span: Span) => Promise<T>,
+    fn: (span: Span, isOwnSpan: boolean) => Promise<T>,
+    /** When false, the caller is responsible for ending the span (e.g., streaming). */
+    manageLifecycle = true,
   ): Promise<T> {
     const activeSpan = trace.getActiveSpan();
     if (activeSpan && activeSpan.isRecording()) {
-      // Mastra's OtelBridge already created a span — enrich it
-      return fn(activeSpan);
+      // Mastra's OtelBridge already created a span — enrich it (don't end it)
+      return fn(activeSpan, false);
     }
     // No active span — create our own
     return this.tracer.startActiveSpan(
@@ -49,9 +52,11 @@ export class MastraInstrumentation extends InstrumentationBase<MastraInstrumenta
       { kind: SpanKind.INTERNAL },
       async (span: Span) => {
         try {
-          const result = await fn(span);
-          span.setStatus({ code: SpanStatusCode.OK });
-          span.end();
+          const result = await fn(span, true);
+          if (manageLifecycle) {
+            span.setStatus({ code: SpanStatusCode.OK });
+            span.end();
+          }
           return result;
         } catch (error: any) {
           span.setStatus({ code: SpanStatusCode.ERROR, message: error?.message });
@@ -63,7 +68,25 @@ export class MastraInstrumentation extends InstrumentationBase<MastraInstrumenta
     );
   }
 
+  /**
+   * Set input.value on a span from the first argument if present.
+   */
+  private _setInputValue(span: Span, args: any[]): void {
+    if (args.length > 0) {
+      const inputValue = safeJsonStringify(args[0]);
+      if (inputValue) {
+        span.setAttribute('input.value', inputValue);
+      }
+    }
+  }
+
   protected init() {
+    // The root @mastra/core entry point may export Agent, Workflow, and
+    // createTool directly (older versions), so we try patching from there.
+    // In newer versions (e.g. 1.25+), these live under subpath exports:
+    //   @mastra/core/agent, @mastra/core/workflows, @mastra/core/tools
+    // We register InstrumentationNodeModuleFile entries for each subpath
+    // so the OTel hook system intercepts them regardless of layout.
     return new InstrumentationNodeModuleDefinition(
       '@mastra/core',
       ['>=1.0.0'],
@@ -74,11 +97,65 @@ export class MastraInstrumentation extends InstrumentationBase<MastraInstrumenta
       (moduleExports: any) => {
         this._unpatch(moduleExports);
       },
+      [
+        new InstrumentationNodeModuleFile(
+          '@mastra/core/agent',
+          ['>=1.0.0'],
+          (moduleExports: any) => {
+            this._patchAgentModule(moduleExports);
+            return moduleExports;
+          },
+          (moduleExports: any) => {
+            this._unpatchAgentModule(moduleExports);
+          },
+        ),
+        new InstrumentationNodeModuleFile(
+          '@mastra/core/workflows',
+          ['>=1.0.0'],
+          (moduleExports: any) => {
+            this._patchWorkflowModule(moduleExports);
+            return moduleExports;
+          },
+          (moduleExports: any) => {
+            this._unpatchWorkflowModule(moduleExports);
+          },
+        ),
+        new InstrumentationNodeModuleFile(
+          '@mastra/core/tools',
+          ['>=1.0.0'],
+          (moduleExports: any) => {
+            this._patchToolsModule(moduleExports);
+            return moduleExports;
+          },
+          (moduleExports: any) => {
+            this._unpatchToolsModule(moduleExports);
+          },
+        ),
+      ],
     );
   }
 
+  /**
+   * Patch the root @mastra/core module (for older versions that export
+   * Agent, Workflow, and createTool from the root entry point).
+   */
   private _patch(moduleExports: any): void {
-    // Patch Agent.prototype.generate and Agent.prototype.stream
+    this._patchAgentModule(moduleExports);
+    this._patchWorkflowModule(moduleExports);
+    this._patchToolsModule(moduleExports);
+  }
+
+  private _unpatch(moduleExports: any): void {
+    this._unpatchAgentModule(moduleExports);
+    this._unpatchWorkflowModule(moduleExports);
+    this._unpatchToolsModule(moduleExports);
+  }
+
+  /**
+   * Patch Agent.prototype.generate and Agent.prototype.stream.
+   * Works for both root module exports and @mastra/core/agent subpath.
+   */
+  private _patchAgentModule(moduleExports: any): void {
     const Agent = moduleExports?.Agent;
     if (Agent?.prototype) {
       this._agentPrototype = Agent.prototype;
@@ -91,8 +168,25 @@ export class MastraInstrumentation extends InstrumentationBase<MastraInstrumenta
         this._wrap(Agent.prototype, 'stream', this._patchAgentStream());
       }
     }
+  }
 
-    // Patch Workflow.prototype.execute
+  private _unpatchAgentModule(_moduleExports?: any): void {
+    if (this._agentPrototype) {
+      if (typeof this._agentPrototype.generate === 'function') {
+        this._unwrap(this._agentPrototype, 'generate');
+      }
+      if (typeof this._agentPrototype.stream === 'function') {
+        this._unwrap(this._agentPrototype, 'stream');
+      }
+      this._agentPrototype = null;
+    }
+  }
+
+  /**
+   * Patch Workflow.prototype.execute.
+   * Works for both root module exports and @mastra/core/workflows subpath.
+   */
+  private _patchWorkflowModule(moduleExports: any): void {
     const Workflow = moduleExports?.Workflow;
     if (Workflow?.prototype) {
       this._workflowPrototype = Workflow.prototype;
@@ -101,35 +195,32 @@ export class MastraInstrumentation extends InstrumentationBase<MastraInstrumenta
         this._wrap(Workflow.prototype, 'execute', this._patchWorkflowExecute());
       }
     }
-
-    // Patch createTool
-    if (typeof moduleExports?.createTool === 'function') {
-      this._originalCreateTool = moduleExports.createTool;
-      this._wrap(moduleExports, 'createTool', this._patchCreateTool());
-    }
   }
 
-  private _unpatch(moduleExports: any): void {
-    if (this._agentPrototype) {
-      if (typeof this._agentPrototype.generate === 'function') {
-        this._unwrap(this._agentPrototype, 'generate');
-      }
-      if (typeof this._agentPrototype.stream === 'function') {
-        this._unwrap(this._agentPrototype, 'stream');
-      }
-      this._agentPrototype = undefined;
-    }
-
+  private _unpatchWorkflowModule(_moduleExports?: any): void {
     if (this._workflowPrototype) {
       if (typeof this._workflowPrototype.execute === 'function') {
         this._unwrap(this._workflowPrototype, 'execute');
       }
-      this._workflowPrototype = undefined;
+      this._workflowPrototype = null;
     }
+  }
 
+  /**
+   * Patch createTool function.
+   * Works for both root module exports and @mastra/core/tools subpath.
+   */
+  private _patchToolsModule(moduleExports: any): void {
+    if (typeof moduleExports?.createTool === 'function') {
+      this._originalCreateTool = moduleExports.createTool;
+      this._wrap(moduleExports, 'createTool', this._patchCreateToolFn());
+    }
+  }
+
+  private _unpatchToolsModule(moduleExports?: any): void {
     if (moduleExports && this._originalCreateTool) {
       this._unwrap(moduleExports, 'createTool');
-      this._originalCreateTool = undefined;
+      this._originalCreateTool = null;
     }
   }
 
@@ -142,13 +233,7 @@ export class MastraInstrumentation extends InstrumentationBase<MastraInstrumenta
           'mastra.agent.generate',
           async (span: Span) => {
             setAgentAttributes(span, agent);
-
-            if (args.length > 0) {
-              const inputValue = safeJsonStringify(args[0]);
-              if (inputValue) {
-                span.setAttribute('input.value', inputValue);
-              }
-            }
+            instrumentation._setInputValue(span, args);
 
             const result = await original.apply(agent, args);
             setAgentResponseAttributes(span, result);
@@ -164,17 +249,12 @@ export class MastraInstrumentation extends InstrumentationBase<MastraInstrumenta
     return function streamPatchFactory(original: Function) {
       return function patchedStream(this: any, ...args: any[]) {
         const agent = this;
+        // Pass manageLifecycle=false so the span stays open until the stream is consumed
         return instrumentation._getOrCreateSpan(
           'mastra.agent.stream',
-          async (span: Span) => {
+          async (span: Span, isOwnSpan: boolean) => {
             setAgentAttributes(span, agent);
-
-            if (args.length > 0) {
-              const inputValue = safeJsonStringify(args[0]);
-              if (inputValue) {
-                span.setAttribute('input.value', inputValue);
-              }
-            }
+            instrumentation._setInputValue(span, args);
 
             const result = await original.apply(agent, args);
 
@@ -183,59 +263,96 @@ export class MastraInstrumentation extends InstrumentationBase<MastraInstrumenta
             if (result && result.textStream) {
               const originalTextStream = result.textStream;
               const chunks: string[] = [];
+              let finalized = false;
+
+              const finalizeStream = async () => {
+                if (finalized) return;
+                finalized = true;
+
+                const accumulatedText = chunks.join('');
+                const responseData: any = { text: accumulatedText };
+
+                try {
+                  if (result.usage && typeof result.usage.then === 'function') {
+                    const usage = await result.usage;
+                    responseData.usage = usage;
+                  } else if (result.usage) {
+                    responseData.usage = result.usage;
+                  }
+                } catch {
+                  // ignore usage errors
+                }
+
+                setAgentResponseAttributes(span, responseData);
+                // Only end the span if we created it (not borrowed from OtelBridge)
+                if (isOwnSpan) {
+                  span.setStatus({ code: SpanStatusCode.OK });
+                  span.end();
+                }
+              };
 
               const wrappedTextStream = {
                 [Symbol.asyncIterator]() {
-                  const iterator =
-                    typeof originalTextStream[Symbol.asyncIterator] === 'function'
-                      ? originalTextStream[Symbol.asyncIterator]()
-                      : originalTextStream;
+                  let iterator: any;
+                  if (typeof originalTextStream[Symbol.asyncIterator] === 'function') {
+                    iterator = originalTextStream[Symbol.asyncIterator]();
+                  } else if (typeof originalTextStream.next === 'function') {
+                    iterator = originalTextStream;
+                  } else {
+                    setAgentResponseAttributes(span, { text: '' });
+                    if (isOwnSpan) {
+                      span.setStatus({ code: SpanStatusCode.OK });
+                      span.end();
+                    }
+                    finalized = true;
+                    return {
+                      async next() { return { done: true as const, value: undefined }; },
+                    };
+                  }
                   return {
                     async next() {
-                      const iterResult = await iterator.next();
-                      if (!iterResult.done && iterResult.value != null) {
-                        chunks.push(
-                          typeof iterResult.value === 'string'
-                            ? iterResult.value
-                            : String(iterResult.value),
-                        );
-                      }
-                      if (iterResult.done) {
-                        // Stream completed — set response attributes
-                        const accumulatedText = chunks.join('');
-                        const responseData: any = { text: accumulatedText };
-
-                        try {
-                          if (result.usage && typeof result.usage.then === 'function') {
-                            const usage = await result.usage;
-                            responseData.usage = usage;
-                          } else if (result.usage) {
-                            responseData.usage = result.usage;
-                          }
-                        } catch {
-                          // ignore usage errors
+                      try {
+                        const iterResult = await iterator.next();
+                        if (!iterResult.done && iterResult.value != null) {
+                          chunks.push(
+                            typeof iterResult.value === 'string'
+                              ? iterResult.value
+                              : String(iterResult.value),
+                          );
                         }
-
-                        setAgentResponseAttributes(span, responseData);
+                        if (iterResult.done) {
+                          await finalizeStream();
+                        }
+                        return iterResult;
+                      } catch (error: any) {
+                        if (!finalized && isOwnSpan) {
+                          finalized = true;
+                          span.setStatus({ code: SpanStatusCode.ERROR, message: error?.message });
+                          span.recordException(error);
+                          span.end();
+                        }
+                        throw error;
                       }
-                      return iterResult;
                     },
                     async return(value?: any) {
-                      // Early termination — still finalize
-                      const accumulatedText = chunks.join('');
-                      setAgentResponseAttributes(span, { text: accumulatedText });
+                      await finalizeStream();
                       return iterator.return?.(value) ?? { done: true as const, value };
                     },
                   };
                 },
               };
 
-              // Return a new result object with the wrapped textStream property
               return { ...result, textStream: wrappedTextStream };
             }
 
+            // No textStream — end span normally
+            if (isOwnSpan) {
+              span.setStatus({ code: SpanStatusCode.OK });
+              span.end();
+            }
             return result;
           },
+          false, // Don't auto-end span — stream wrapper or fallback handles it
         );
       };
     };
@@ -250,13 +367,7 @@ export class MastraInstrumentation extends InstrumentationBase<MastraInstrumenta
           'mastra.workflow.execute',
           async (span: Span) => {
             setWorkflowAttributes(span, workflow);
-
-            if (args.length > 0) {
-              const inputValue = safeJsonStringify(args[0]);
-              if (inputValue) {
-                span.setAttribute('input.value', inputValue);
-              }
-            }
+            instrumentation._setInputValue(span, args);
 
             const result = await original.apply(workflow, args);
 
@@ -272,7 +383,7 @@ export class MastraInstrumentation extends InstrumentationBase<MastraInstrumenta
     };
   }
 
-  private _patchCreateTool() {
+  private _patchCreateToolFn() {
     const instrumentation = this;
     return function createToolPatchFactory(original: Function) {
       return function patchedCreateTool(this: any, ...args: any[]) {

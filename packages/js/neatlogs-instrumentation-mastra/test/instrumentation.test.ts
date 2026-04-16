@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { trace, SpanKind, SpanStatusCode, context } from '@opentelemetry/api';
+import { trace, context, SpanStatusCode } from '@opentelemetry/api';
 import {
   InMemorySpanExporter,
   SimpleSpanProcessor,
@@ -34,6 +34,14 @@ describe('MastraInstrumentation', () => {
     const moduleDefs = (instrumentation as any).init();
     expect(moduleDefs).toBeDefined();
     expect(moduleDefs.name).toBe('@mastra/core');
+
+    // Subpath module files should be registered for newer Mastra versions
+    expect(moduleDefs.files).toBeDefined();
+    expect(moduleDefs.files.length).toBe(3);
+    const fileNames = moduleDefs.files.map((f: any) => f.name);
+    expect(fileNames).toContain('@mastra/core/agent');
+    expect(fileNames).toContain('@mastra/core/workflows');
+    expect(fileNames).toContain('@mastra/core/tools');
   });
 
   describe('_getOrCreateSpan', () => {
@@ -168,6 +176,51 @@ describe('MastraInstrumentation', () => {
       expect(() => (instrumentation as any)._patch(moduleExports)).not.toThrow();
     });
 
+    it('should patch Agent from subpath module (@mastra/core/agent)', () => {
+      const originalGenerate = vi.fn();
+      const mockAgent = {
+        prototype: {
+          generate: originalGenerate,
+        },
+      };
+      // Simulate the subpath module exporting Agent
+      const subpathExports = { Agent: mockAgent };
+      (instrumentation as any)._patchAgentModule(subpathExports);
+
+      expect(mockAgent.prototype.generate).not.toBe(originalGenerate);
+
+      // Clean up
+      (instrumentation as any)._unpatchAgentModule(subpathExports);
+      expect(mockAgent.prototype.generate).toBe(originalGenerate);
+    });
+
+    it('should patch Workflow from subpath module (@mastra/core/workflows)', () => {
+      const originalExecute = vi.fn();
+      const mockWorkflow = {
+        prototype: {
+          execute: originalExecute,
+        },
+      };
+      const subpathExports = { Workflow: mockWorkflow };
+      (instrumentation as any)._patchWorkflowModule(subpathExports);
+
+      expect(mockWorkflow.prototype.execute).not.toBe(originalExecute);
+
+      (instrumentation as any)._unpatchWorkflowModule(subpathExports);
+      expect(mockWorkflow.prototype.execute).toBe(originalExecute);
+    });
+
+    it('should patch createTool from subpath module (@mastra/core/tools)', () => {
+      const originalCreateTool = vi.fn();
+      const subpathExports = { createTool: originalCreateTool };
+      (instrumentation as any)._patchToolsModule(subpathExports);
+
+      expect(subpathExports.createTool).not.toBe(originalCreateTool);
+
+      (instrumentation as any)._unpatchToolsModule(subpathExports);
+      expect(subpathExports.createTool).toBe(originalCreateTool);
+    });
+
     it('should unpatch Agent prototype methods', () => {
       const originalGenerate = vi.fn();
       const originalStream = vi.fn();
@@ -261,6 +314,196 @@ describe('MastraInstrumentation', () => {
       expect(spans[0].attributes['llm.token_count.prompt']).toBe(10);
       expect(spans[0].attributes['llm.token_count.completion']).toBe(5);
       expect(spans[0].attributes['llm.token_count.total']).toBe(15);
+    });
+  });
+
+  describe('Agent.stream patch behavior', () => {
+    let provider: NodeTracerProvider;
+    let exporter: InMemorySpanExporter;
+
+    beforeEach(() => {
+      exporter = new InMemorySpanExporter();
+      provider = new NodeTracerProvider();
+      provider.addSpanProcessor(new SimpleSpanProcessor(exporter));
+      provider.register();
+      instrumentation.setTracerProvider(provider);
+    });
+
+    afterEach(async () => {
+      exporter.reset();
+      await provider.shutdown();
+    });
+
+    it('should wrap agent.stream and set attributes after consuming textStream', async () => {
+      const textChunks = ['Hello', ', ', 'world', '!'];
+      let chunkIndex = 0;
+
+      const mockTextStream = {
+        [Symbol.asyncIterator]() {
+          return {
+            async next() {
+              if (chunkIndex < textChunks.length) {
+                return { done: false, value: textChunks[chunkIndex++] };
+              }
+              return { done: true, value: undefined };
+            },
+          };
+        },
+      };
+
+      const streamResult = {
+        textStream: mockTextStream,
+        usage: { promptTokens: 20, completionTokens: 10, totalTokens: 30 },
+      };
+
+      const mockAgentInstance = {
+        name: 'StreamAgent',
+        instructions: 'Stream responses',
+        model: { modelId: 'gpt-4o' },
+        tools: {},
+      };
+
+      const originalStream = vi.fn().mockResolvedValue(streamResult);
+      const mockAgent = {
+        prototype: {
+          stream: originalStream,
+          generate: vi.fn(), // needed so _patch doesn't skip Agent
+        },
+      };
+
+      const moduleExports = { Agent: mockAgent };
+      (instrumentation as any)._patch(moduleExports);
+
+      const result = await mockAgent.prototype.stream.call(
+        mockAgentInstance,
+        'Tell me a story',
+      );
+
+      // Consume the wrapped textStream
+      const collectedChunks: string[] = [];
+      for await (const chunk of result.textStream) {
+        collectedChunks.push(chunk);
+      }
+
+      expect(collectedChunks).toEqual(textChunks);
+
+      const spans = exporter.getFinishedSpans();
+      expect(spans.length).toBe(1);
+      expect(spans[0].name).toBe('mastra.agent.stream');
+      expect(spans[0].attributes['openinference.span.kind']).toBe('AGENT');
+      expect(spans[0].attributes['agent.name']).toBe('StreamAgent');
+      expect(spans[0].attributes['llm.model_name']).toBe('gpt-4o');
+      expect(spans[0].attributes['input.value']).toBe('"Tell me a story"');
+      // After stream consumption, output.value should contain accumulated text
+      expect(spans[0].attributes['output.value']).toBe('Hello, world!');
+      expect(spans[0].attributes['llm.token_count.prompt']).toBe(20);
+      expect(spans[0].attributes['llm.token_count.completion']).toBe(10);
+      expect(spans[0].attributes['llm.token_count.total']).toBe(30);
+    });
+
+    it('should enrich but NOT end a borrowed active span during stream consumption', async () => {
+      const textChunks = ['Hi', ' there'];
+      let chunkIndex = 0;
+
+      const mockTextStream = {
+        [Symbol.asyncIterator]() {
+          return {
+            async next() {
+              if (chunkIndex < textChunks.length) {
+                return { done: false, value: textChunks[chunkIndex++] };
+              }
+              return { done: true, value: undefined };
+            },
+          };
+        },
+      };
+
+      const streamResult = {
+        textStream: mockTextStream,
+        usage: { promptTokens: 5, completionTokens: 3, totalTokens: 8 },
+      };
+
+      const mockAgentInstance = {
+        name: 'BorrowedSpanAgent',
+        model: { modelId: 'gpt-4o' },
+        tools: {},
+      };
+
+      const originalStream = vi.fn().mockResolvedValue(streamResult);
+      const mockAgent = {
+        prototype: {
+          stream: originalStream,
+          generate: vi.fn(),
+        },
+      };
+
+      const moduleExports = { Agent: mockAgent };
+      (instrumentation as any)._patch(moduleExports);
+
+      // Create an active span to simulate Mastra's OtelBridge
+      const tracer = provider.getTracer('test');
+      const otelBridgeSpan = tracer.startSpan('mastra.otelbridge.agent');
+      const ctx = trace.setSpan(context.active(), otelBridgeSpan);
+
+      // Call stream within the active span context
+      const result = await context.with(ctx, async () => {
+        return mockAgent.prototype.stream.call(mockAgentInstance, 'Hello');
+      });
+
+      // Consume the wrapped textStream within the same context
+      const collectedChunks: string[] = [];
+      await context.with(ctx, async () => {
+        for await (const chunk of result.textStream) {
+          collectedChunks.push(chunk);
+        }
+      });
+
+      expect(collectedChunks).toEqual(textChunks);
+
+      // The OtelBridge span should still be recording (not ended by our instrumentation)
+      expect(otelBridgeSpan.isRecording()).toBe(true);
+
+      // But attributes should have been set on it
+      // End it manually now so it shows up in the exporter
+      otelBridgeSpan.end();
+
+      const spans = exporter.getFinishedSpans();
+      const bridgeSpan = spans.find(s => s.name === 'mastra.otelbridge.agent');
+      expect(bridgeSpan).toBeDefined();
+      expect(bridgeSpan!.attributes['openinference.span.kind']).toBe('AGENT');
+      expect(bridgeSpan!.attributes['agent.name']).toBe('BorrowedSpanAgent');
+      expect(bridgeSpan!.attributes['output.value']).toBe('Hi there');
+
+      // No additional span should have been created by the instrumentation
+      const agentStreamSpans = spans.filter(s => s.name === 'mastra.agent.stream');
+      expect(agentStreamSpans.length).toBe(0);
+    });
+
+    it('should handle stream result without textStream gracefully', async () => {
+      const streamResult = { text: 'direct response' };
+
+      const mockAgentInstance = { name: 'NoStreamAgent' };
+      const originalStream = vi.fn().mockResolvedValue(streamResult);
+      const mockAgent = {
+        prototype: {
+          stream: originalStream,
+          generate: vi.fn(),
+        },
+      };
+
+      const moduleExports = { Agent: mockAgent };
+      (instrumentation as any)._patch(moduleExports);
+
+      const result = await mockAgent.prototype.stream.call(
+        mockAgentInstance,
+        'Hello',
+      );
+
+      expect(result).toEqual(streamResult);
+
+      const spans = exporter.getFinishedSpans();
+      expect(spans.length).toBe(1);
+      expect(spans[0].name).toBe('mastra.agent.stream');
     });
   });
 

@@ -57,21 +57,30 @@ describe('GoogleGenAIInstrumentation patching', () => {
     instrumentation = new GoogleGenAIInstrumentation();
     instrumentation.setTracerProvider(provider);
 
-    // Create mock module with Models prototype
+    // Create mock module that mirrors the real @google/genai SDK structure:
+    // - generateContentInternal / generateContentStreamInternal are on the prototype
+    // - generateContent / generateContentStream are instance arrow functions
+    //   assigned in the constructor that delegate to the internal methods
     mockModelsProto = {
-      generateContent: vi.fn(),
-      generateContentStream: vi.fn(),
+      generateContentInternal: vi.fn(),
+      generateContentStreamInternal: vi.fn(),
     };
 
     MockGoogleGenAI = function (this: any, _config: any) {
-      this.models = Object.create(mockModelsProto);
+      const models = Object.create(mockModelsProto);
+      // Simulate instance arrow functions that delegate to internal methods
+      models.generateContent = async (...args: any[]) =>
+        models.generateContentInternal(...args);
+      models.generateContentStream = async (...args: any[]) =>
+        models.generateContentStreamInternal(...args);
+      this.models = models;
     };
 
     const mockModule = {
       GoogleGenAI: MockGoogleGenAI,
     };
 
-    // Manually trigger the patch callback by accessing init definitions
+    // Manually trigger the patch callback
     const definitions = instrumentation.getModuleDefinitions();
     const patchFn = definitions[0].patch;
     if (patchFn) {
@@ -84,15 +93,14 @@ describe('GoogleGenAIInstrumentation patching', () => {
     provider.shutdown();
   });
 
-  it('should patch generateContent on the Models prototype', () => {
-    // After patching, the prototype method should be wrapped
-    expect(mockModelsProto.generateContent).not.toBe(vi.fn());
+  it('should patch generateContentInternal on the Models prototype', () => {
+    expect(typeof mockModelsProto.generateContentInternal).toBe('function');
     // The patched function should be different from the original mock
-    expect(typeof mockModelsProto.generateContent).toBe('function');
+    expect(mockModelsProto.generateContentInternal).not.toBe(vi.fn());
   });
 
-  it('should patch generateContentStream on the Models prototype', () => {
-    expect(typeof mockModelsProto.generateContentStream).toBe('function');
+  it('should patch generateContentStreamInternal on the Models prototype', () => {
+    expect(typeof mockModelsProto.generateContentStreamInternal).toBe('function');
   });
 
   describe('generateContent', () => {
@@ -114,21 +122,19 @@ describe('GoogleGenAIInstrumentation patching', () => {
         },
       };
 
-      // Get the original fn reference before patching
-      // The patch wraps the original, so we need to set it up before calling
-      // Actually, let's re-setup:
-      const originalFn = vi.fn().mockResolvedValue(mockResult);
-      mockModelsProto.generateContent = originalFn;
+      // Set the internal method to return our mock result
+      mockModelsProto.generateContentInternal = vi.fn().mockResolvedValue(mockResult);
 
-      // Re-patch
+      // Re-patch with the new mock
       const definitions = instrumentation.getModuleDefinitions();
       definitions[0].patch!(
         { GoogleGenAI: MockGoogleGenAI },
         '1.0.0',
       );
 
-      const modelsInstance = Object.create(mockModelsProto);
-      await modelsInstance.generateContent({
+      // Create an instance — its arrow function delegates to the patched internal method
+      const client = new MockGoogleGenAI({ apiKey: 'test' });
+      await client.models.generateContent({
         model: 'gemini-2.0-flash',
         contents: [
           { role: 'user', parts: [{ text: 'Hello' }] },
@@ -179,10 +185,9 @@ describe('GoogleGenAIInstrumentation patching', () => {
     });
 
     it('should handle errors in generateContent', async () => {
-      const originalFn = vi
+      mockModelsProto.generateContentInternal = vi
         .fn()
         .mockRejectedValue(new Error('API error'));
-      mockModelsProto.generateContent = originalFn;
 
       const definitions = instrumentation.getModuleDefinitions();
       definitions[0].patch!(
@@ -190,9 +195,9 @@ describe('GoogleGenAIInstrumentation patching', () => {
         '1.0.0',
       );
 
-      const modelsInstance = Object.create(mockModelsProto);
+      const client = new MockGoogleGenAI({ apiKey: 'test' });
       await expect(
-        modelsInstance.generateContent({
+        client.models.generateContent({
           model: 'gemini-2.0-flash',
           contents: [],
         }),
@@ -206,8 +211,7 @@ describe('GoogleGenAIInstrumentation patching', () => {
     });
 
     it('should handle model name from string request', async () => {
-      const originalFn = vi.fn().mockResolvedValue({ candidates: [] });
-      mockModelsProto.generateContent = originalFn;
+      mockModelsProto.generateContentInternal = vi.fn().mockResolvedValue({ candidates: [] });
 
       const definitions = instrumentation.getModuleDefinitions();
       definitions[0].patch!(
@@ -215,8 +219,8 @@ describe('GoogleGenAIInstrumentation patching', () => {
         '1.0.0',
       );
 
-      const modelsInstance = Object.create(mockModelsProto);
-      await modelsInstance.generateContent('gemini-pro');
+      const client = new MockGoogleGenAI({ apiKey: 'test' });
+      await client.models.generateContent('gemini-pro');
 
       const spans = exporter.getFinishedSpans();
       expect(spans[0].name).toBe('gemini-pro generate');
@@ -260,8 +264,7 @@ describe('GoogleGenAIInstrumentation patching', () => {
         },
       };
 
-      const originalFn = vi.fn().mockResolvedValue(mockStream);
-      mockModelsProto.generateContentStream = originalFn;
+      mockModelsProto.generateContentStreamInternal = vi.fn().mockResolvedValue(mockStream);
 
       const definitions = instrumentation.getModuleDefinitions();
       definitions[0].patch!(
@@ -269,8 +272,8 @@ describe('GoogleGenAIInstrumentation patching', () => {
         '1.0.0',
       );
 
-      const modelsInstance = Object.create(mockModelsProto);
-      const stream = await modelsInstance.generateContentStream({
+      const client = new MockGoogleGenAI({ apiKey: 'test' });
+      const stream = await client.models.generateContentStream({
         model: 'gemini-2.0-flash',
         contents: [
           { role: 'user', parts: [{ text: 'Hi' }] },
@@ -315,8 +318,7 @@ describe('GoogleGenAIInstrumentation patching', () => {
         },
       };
 
-      const originalFn = vi.fn().mockResolvedValue(mockStream);
-      mockModelsProto.generateContentStream = originalFn;
+      mockModelsProto.generateContentStreamInternal = vi.fn().mockResolvedValue(mockStream);
 
       const definitions = instrumentation.getModuleDefinitions();
       definitions[0].patch!(
@@ -324,8 +326,8 @@ describe('GoogleGenAIInstrumentation patching', () => {
         '1.0.0',
       );
 
-      const modelsInstance = Object.create(mockModelsProto);
-      const stream = await modelsInstance.generateContentStream({
+      const client = new MockGoogleGenAI({ apiKey: 'test' });
+      const stream = await client.models.generateContentStream({
         model: 'gemini-2.0-flash',
         contents: [],
       });
@@ -364,8 +366,7 @@ describe('GoogleGenAIInstrumentation patching', () => {
         },
       };
 
-      const originalFn = vi.fn().mockResolvedValue(mockStream);
-      mockModelsProto.generateContentStream = originalFn;
+      mockModelsProto.generateContentStreamInternal = vi.fn().mockResolvedValue(mockStream);
 
       const definitions = instrumentation.getModuleDefinitions();
       definitions[0].patch!(
@@ -373,8 +374,8 @@ describe('GoogleGenAIInstrumentation patching', () => {
         '1.0.0',
       );
 
-      const modelsInstance = Object.create(mockModelsProto);
-      const stream = await modelsInstance.generateContentStream({
+      const client = new MockGoogleGenAI({ apiKey: 'test' });
+      const stream = await client.models.generateContentStream({
         model: 'gemini-2.0-flash',
         contents: [],
       });
@@ -401,8 +402,7 @@ describe('GoogleGenAIInstrumentation patching', () => {
         },
       };
 
-      const originalFn = vi.fn().mockResolvedValue(mockStream);
-      mockModelsProto.generateContentStream = originalFn;
+      mockModelsProto.generateContentStreamInternal = vi.fn().mockResolvedValue(mockStream);
 
       const definitions = instrumentation.getModuleDefinitions();
       definitions[0].patch!(
@@ -410,8 +410,8 @@ describe('GoogleGenAIInstrumentation patching', () => {
         '1.0.0',
       );
 
-      const modelsInstance = Object.create(mockModelsProto);
-      const stream = await modelsInstance.generateContentStream({
+      const client = new MockGoogleGenAI({ apiKey: 'test' });
+      const stream = await client.models.generateContentStream({
         model: 'gemini-2.0-flash',
         contents: [],
       });
@@ -421,16 +421,31 @@ describe('GoogleGenAIInstrumentation patching', () => {
   });
 
   describe('unpatch', () => {
-    it('should restore original methods on unpatch', () => {
-      const definitions = instrumentation.getModuleDefinitions();
-      const unpatchFn = definitions[0].unpatch;
+    it('should restore original internal methods on unpatch', () => {
+      const originalGenerate = vi.fn();
+      const originalStream = vi.fn();
+      mockModelsProto.generateContentInternal = originalGenerate;
+      mockModelsProto.generateContentStreamInternal = originalStream;
 
-      // After patch, methods are wrapped. After unpatch, they should be restored.
+      // Re-patch with known originals
+      const definitions = instrumentation.getModuleDefinitions();
+      definitions[0].patch!(
+        { GoogleGenAI: MockGoogleGenAI },
+        '1.0.0',
+      );
+
+      // After patching, methods should be wrapped (different references)
+      expect(mockModelsProto.generateContentInternal).not.toBe(originalGenerate);
+      expect(mockModelsProto.generateContentStreamInternal).not.toBe(originalStream);
+
+      const unpatchFn = definitions[0].unpatch;
       if (unpatchFn) {
         unpatchFn({ GoogleGenAI: MockGoogleGenAI }, '1.0.0');
       }
 
-      // Instrumentation disabled — no more error since we test via the API
+      // After unpatching, original functions should be restored
+      expect(mockModelsProto.generateContentInternal).toBe(originalGenerate);
+      expect(mockModelsProto.generateContentStreamInternal).toBe(originalStream);
     });
   });
 });

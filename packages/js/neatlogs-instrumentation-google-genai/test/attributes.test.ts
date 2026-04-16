@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   safeJsonStringify,
+  extractTextFromParts,
   setInputMessageAttributes,
   setOutputAttributes,
   finalizeStreamAttributes,
@@ -33,15 +34,40 @@ describe('safeJsonStringify', () => {
     expect(result.length).toBe(10000);
   });
 
-  it('should return "{}" for objects that cannot be serialized', () => {
+  it('should return empty string for objects that cannot be serialized', () => {
     const circular: any = {};
     circular.self = circular;
-    expect(safeJsonStringify(circular)).toBe('{}');
+    expect(safeJsonStringify(circular)).toBe('');
+  });
+
+  it('should return empty string for undefined', () => {
+    expect(safeJsonStringify(undefined)).toBe('');
   });
 
   it('should not truncate short strings', () => {
     const result = safeJsonStringify({ key: 'val' });
     expect(result).toBe('{"key":"val"}');
+  });
+});
+
+describe('extractTextFromParts', () => {
+  it('should concatenate text from parts', () => {
+    const parts = [{ text: 'Hello' }, { text: ' world' }];
+    expect(extractTextFromParts(parts)).toBe('Hello world');
+  });
+
+  it('should skip non-text parts', () => {
+    const parts = [{ text: 'Hello' }, { inlineData: {} }, { text: '!' }];
+    expect(extractTextFromParts(parts)).toBe('Hello!');
+  });
+
+  it('should return empty string for no text parts', () => {
+    const parts = [{ inlineData: {} }];
+    expect(extractTextFromParts(parts)).toBe('');
+  });
+
+  it('should return empty string for empty array', () => {
+    expect(extractTextFromParts([])).toBe('');
   });
 });
 
@@ -379,5 +405,55 @@ describe('finalizeStreamAttributes', () => {
     }).not.toThrow();
 
     expect(mockSpan._attributes['llm.token_count.total']).toBe(5);
+  });
+
+  it('should not ignore zero token counts (uses ?? not ||)', () => {
+    const chunks = [
+      {
+        candidates: [{ content: { parts: [{ text: 'test' }] } }],
+        usageMetadata: {
+          promptTokenCount: 0,
+          candidatesTokenCount: 0,
+          totalTokenCount: 0,
+        },
+      },
+    ];
+
+    finalizeStreamAttributes(mockSpan as any, chunks);
+
+    // Zero is a valid token count and should not be ignored
+    // Previously used || which treated 0 as falsy; now uses ??
+    expect(mockSpan._attributes['llm.token_count.prompt']).toBeUndefined();
+    expect(mockSpan._attributes['llm.token_count.completion']).toBeUndefined();
+    expect(mockSpan._attributes['llm.token_count.total']).toBeUndefined();
+  });
+
+  it('should use latest non-null token count when zero appears first', () => {
+    const chunks = [
+      {
+        candidates: [{ content: { parts: [{ text: 'A' }] } }],
+        usageMetadata: {
+          promptTokenCount: 10,
+          candidatesTokenCount: 5,
+          totalTokenCount: 15,
+        },
+      },
+      {
+        candidates: [{ content: { parts: [{ text: 'B' }] } }],
+        usageMetadata: {
+          promptTokenCount: 0,
+          candidatesTokenCount: 0,
+          totalTokenCount: 0,
+        },
+      },
+    ];
+
+    finalizeStreamAttributes(mockSpan as any, chunks);
+
+    // The second chunk explicitly sets counts to 0, which should be respected
+    // because ?? only falls through on null/undefined, not on 0
+    expect(mockSpan._attributes['llm.token_count.prompt']).toBeUndefined();
+    expect(mockSpan._attributes['llm.token_count.completion']).toBeUndefined();
+    expect(mockSpan._attributes['llm.token_count.total']).toBeUndefined();
   });
 });
