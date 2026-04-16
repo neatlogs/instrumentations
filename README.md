@@ -2,7 +2,24 @@
 
 Neatlogs OpenTelemetry-compatible instrumentations for AI agent ecosystems.
 
-## Install
+## Packages
+
+### Python
+
+| Package | Target Library |
+|---------|----------------|
+| `neatlogs-instrumentation-azure-ai-inference` | `azure.ai.inference` |
+
+### TypeScript / JavaScript
+
+| Package | Target Library |
+|---------|----------------|
+| `@neatlogs/instrumentation-google-genai` | `@google/genai` |
+| `@neatlogs/instrumentation-mastra` | `@mastra/core` |
+
+See [`packages/js/`](packages/js/) for TypeScript package documentation and development setup.
+
+## Install (Python)
 
 Install from PyPI:
 

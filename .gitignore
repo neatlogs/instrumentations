@@ -20,3 +20,9 @@ dist/
 
 # OS
 .DS_Store
+
+# JavaScript / TypeScript
+node_modules/
+packages/js/**/dist/
+*.tsbuildinfo
+.turbo/

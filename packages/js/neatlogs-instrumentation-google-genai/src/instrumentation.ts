@@ -1,0 +1,272 @@
+import {
+  InstrumentationBase,
+  InstrumentationNodeModuleDefinition,
+} from '@opentelemetry/instrumentation';
+import { SpanKind, SpanStatusCode, type Span } from '@opentelemetry/api';
+import type { GoogleGenAIInstrumentationConfig } from './types.js';
+import {
+  setInputMessageAttributes,
+  setOutputAttributes,
+  finalizeStreamAttributes,
+} from './attributes.js';
+
+const INSTRUMENTATION_NAME = '@neatlogs/instrumentation-google-genai';
+const INSTRUMENTATION_VERSION = '0.1.0';
+
+export class GoogleGenAIInstrumentation extends InstrumentationBase<GoogleGenAIInstrumentationConfig> {
+  private _modelsProto: any = null;
+
+  constructor(config: GoogleGenAIInstrumentationConfig = {}) {
+    super(INSTRUMENTATION_NAME, INSTRUMENTATION_VERSION, config);
+  }
+
+  protected init() {
+    return new InstrumentationNodeModuleDefinition(
+      '@google/genai',
+      ['>=0.1.0'],
+      (moduleExports: any, _moduleVersion?: string) => {
+        this._patchModule(moduleExports);
+        return moduleExports;
+      },
+      (_moduleExports: any, _moduleVersion?: string) => {
+        this._unpatchModule();
+      },
+    );
+  }
+
+  private _findModelsPrototype(genaiModule: any): any {
+    try {
+      // Try direct class access first
+      if (genaiModule.Models?.prototype) {
+        return genaiModule.Models.prototype;
+      }
+      // Try creating a temporary instance to find the prototype
+      const tempClient = new genaiModule.GoogleGenAI({ apiKey: 'temp' });
+      if (tempClient.models) {
+        return Object.getPrototypeOf(tempClient.models);
+      }
+    } catch {
+      // Ignore — library may not be installed or API changed
+    }
+    return null;
+  }
+
+  private _patchModule(moduleExports: any): void {
+    const ModelsProto = this._findModelsPrototype(moduleExports);
+    if (!ModelsProto) {
+      this._diag.debug(
+        '@google/genai Models prototype not found, skipping patch',
+      );
+      return;
+    }
+
+    this._modelsProto = ModelsProto;
+
+    if (ModelsProto.generateContent) {
+      this._wrap(
+        ModelsProto,
+        'generateContent',
+        this._patchGenerateContent(),
+      );
+    }
+
+    if (ModelsProto.generateContentStream) {
+      this._wrap(
+        ModelsProto,
+        'generateContentStream',
+        this._patchGenerateContentStream(),
+      );
+    }
+  }
+
+  private _unpatchModule(): void {
+    if (this._modelsProto) {
+      if (this._modelsProto.generateContent) {
+        this._unwrap(this._modelsProto, 'generateContent');
+      }
+      if (this._modelsProto.generateContentStream) {
+        this._unwrap(this._modelsProto, 'generateContentStream');
+      }
+      this._modelsProto = null;
+    }
+  }
+
+  private _patchGenerateContent() {
+    const instrumentation = this;
+    return (original: Function) => {
+      return async function (this: any, ...args: any[]) {
+        const request = args[0] || {};
+        const model =
+          typeof request === 'string'
+            ? request
+            : request.model || 'unknown';
+        const contents = request.contents || [];
+        const spanName = `${model} generate`;
+
+        return instrumentation.tracer.startActiveSpan(
+          spanName,
+          { kind: SpanKind.CLIENT },
+          async (span: Span) => {
+            try {
+              span.setAttribute('openinference.span.kind', 'LLM');
+              span.setAttribute('gen_ai.system', 'google_genai');
+              span.setAttribute('gen_ai.request.model', model);
+              span.setAttribute('llm.model_name', model);
+
+              setInputMessageAttributes(span, contents);
+
+              if (request.config) {
+                const config = request.config;
+                if (config.temperature !== undefined) {
+                  span.setAttribute(
+                    'gen_ai.request.temperature',
+                    config.temperature,
+                  );
+                }
+                if (config.maxOutputTokens !== undefined) {
+                  span.setAttribute(
+                    'gen_ai.request.max_tokens',
+                    config.maxOutputTokens,
+                  );
+                }
+                if (config.topP !== undefined) {
+                  span.setAttribute('gen_ai.request.top_p', config.topP);
+                }
+                if (config.topK !== undefined) {
+                  span.setAttribute('gen_ai.request.top_k', config.topK);
+                }
+              }
+
+              const result = await original.apply(this, args);
+
+              setOutputAttributes(span, result);
+              span.setStatus({ code: SpanStatusCode.OK });
+              span.end();
+              return result;
+            } catch (error: any) {
+              span.setStatus({
+                code: SpanStatusCode.ERROR,
+                message: error?.message,
+              });
+              span.recordException(error);
+              span.end();
+              throw error;
+            }
+          },
+        );
+      };
+    };
+  }
+
+  private _patchGenerateContentStream() {
+    const instrumentation = this;
+    return (original: Function) => {
+      return async function (this: any, ...args: any[]) {
+        const request = args[0] || {};
+        const model =
+          typeof request === 'string'
+            ? request
+            : request.model || 'unknown';
+        const contents = request.contents || [];
+        const spanName = `${model} stream`;
+
+        return instrumentation.tracer.startActiveSpan(
+          spanName,
+          { kind: SpanKind.CLIENT },
+          async (span: Span) => {
+            try {
+              span.setAttribute('openinference.span.kind', 'LLM');
+              span.setAttribute('gen_ai.system', 'google_genai');
+              span.setAttribute('gen_ai.request.model', model);
+              span.setAttribute('llm.model_name', model);
+
+              setInputMessageAttributes(span, contents);
+
+              if (request.config) {
+                const config = request.config;
+                if (config.temperature !== undefined) {
+                  span.setAttribute(
+                    'gen_ai.request.temperature',
+                    config.temperature,
+                  );
+                }
+                if (config.maxOutputTokens !== undefined) {
+                  span.setAttribute(
+                    'gen_ai.request.max_tokens',
+                    config.maxOutputTokens,
+                  );
+                }
+                if (config.topP !== undefined) {
+                  span.setAttribute('gen_ai.request.top_p', config.topP);
+                }
+                if (config.topK !== undefined) {
+                  span.setAttribute('gen_ai.request.top_k', config.topK);
+                }
+              }
+
+              const streamResult = await original.apply(this, args);
+
+              return instrumentation._wrapStream(span, streamResult);
+            } catch (error: any) {
+              span.setStatus({
+                code: SpanStatusCode.ERROR,
+                message: error?.message,
+              });
+              span.recordException(error);
+              span.end();
+              throw error;
+            }
+          },
+        );
+      };
+    };
+  }
+
+  private _wrapStream(span: Span, streamResult: any): any {
+    const chunks: any[] = [];
+    const originalStream = streamResult;
+
+    const wrappedStream = {
+      [Symbol.asyncIterator]() {
+        const iterator = originalStream[Symbol.asyncIterator]();
+        return {
+          async next() {
+            try {
+              const result = await iterator.next();
+              if (!result.done && result.value) {
+                chunks.push(result.value);
+              }
+              if (result.done) {
+                finalizeStreamAttributes(span, chunks);
+                span.setStatus({ code: SpanStatusCode.OK });
+                span.end();
+              }
+              return result;
+            } catch (error: any) {
+              span.setStatus({
+                code: SpanStatusCode.ERROR,
+                message: error?.message,
+              });
+              span.recordException(error);
+              span.end();
+              throw error;
+            }
+          },
+          async return(value?: any) {
+            finalizeStreamAttributes(span, chunks);
+            span.setStatus({ code: SpanStatusCode.OK });
+            span.end();
+            return iterator.return?.(value) ?? { done: true as const, value };
+          },
+        };
+      },
+    };
+
+    // Copy non-iterator properties from the original stream
+    for (const key of Object.keys(originalStream)) {
+      (wrappedStream as any)[key] = originalStream[key];
+    }
+
+    return wrappedStream;
+  }
+}

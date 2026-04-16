@@ -1,0 +1,14 @@
+{
+  "name": "@neatlogs/instrumentations-js",
+  "private": true,
+  "description": "Neatlogs TypeScript/JavaScript OpenTelemetry instrumentations",
+  "scripts": {
+    "build": "pnpm -r run build",
+    "test": "pnpm -r run test",
+    "lint": "pnpm -r run lint",
+    "clean": "pnpm -r run clean"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
