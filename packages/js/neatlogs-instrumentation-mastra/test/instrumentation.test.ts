@@ -240,6 +240,79 @@ describe('MastraInstrumentation', () => {
       expect(unrelatedExports.createTool).not.toBe(originalCreateTool); // untouched ✓
     });
 
+    it('should attempt dynamic require fallback when root exports lack classes', () => {
+      // When moduleExports (root @mastra/core) doesn't have Agent, Workflow,
+      // or createTool, _patch() enters the dynamic-require fallback branches.
+      // Since @mastra/core IS installed as a dev dependency, the require()
+      // calls succeed and the real subpath modules get patched. We verify
+      // that the fallback path fires by checking that prototypes are stored
+      // from the dynamically-required modules.
+      //
+      // NOTE: This test depends on @mastra/core being available as a
+      // devDependency. If the dependency is removed or its subpath exports
+      // change, this test may need updating.
+      const emptyExports = {};
+      (instrumentation as any)._patch(emptyExports);
+
+      // The dynamic require loaded the real @mastra/core subpath modules
+      // and patched them, so the prototype references should be set.
+      expect((instrumentation as any)._agentPrototype).not.toBeNull();
+      expect((instrumentation as any)._workflowPrototype).not.toBeNull();
+      expect((instrumentation as any)._patchedToolsModule).not.toBeNull();
+
+      // Clean up: unpatch the real modules
+      (instrumentation as any)._unpatch(emptyExports);
+    });
+
+    it('should skip dynamic require when root exports already contain Agent', () => {
+      // When root exports have Agent, the dynamic require for @mastra/core/agent
+      // should NOT fire. We verify by checking that _agentPrototype is set from
+      // the root exports object.
+      const originalGenerate = vi.fn();
+      const mockAgent = {
+        prototype: { generate: originalGenerate, stream: vi.fn() },
+      };
+      const moduleExports = { Agent: mockAgent };
+
+      (instrumentation as any)._patch(moduleExports);
+
+      // _agentPrototype should point to the root export's prototype
+      expect((instrumentation as any)._agentPrototype).toBe(mockAgent.prototype);
+      expect(mockAgent.prototype.generate).not.toBe(originalGenerate);
+
+      (instrumentation as any)._unpatch(moduleExports);
+    });
+
+    it('should skip dynamic require when root exports already contain Workflow', () => {
+      const originalExecute = vi.fn();
+      const mockWorkflow = {
+        prototype: { execute: originalExecute },
+      };
+      const moduleExports = { Workflow: mockWorkflow };
+
+      (instrumentation as any)._patch(moduleExports);
+
+      expect((instrumentation as any)._workflowPrototype).toBe(mockWorkflow.prototype);
+      expect(mockWorkflow.prototype.execute).not.toBe(originalExecute);
+
+      (instrumentation as any)._unpatch(moduleExports);
+    });
+
+    it('should skip dynamic require when root exports already contain createTool', () => {
+      const originalCreateTool = vi.fn().mockReturnValue({
+        id: 'tool1',
+        execute: vi.fn().mockResolvedValue({}),
+      });
+      const moduleExports = { createTool: originalCreateTool };
+
+      (instrumentation as any)._patch(moduleExports);
+
+      expect((instrumentation as any)._patchedToolsModule).toBe(moduleExports);
+      expect(moduleExports.createTool).not.toBe(originalCreateTool);
+
+      (instrumentation as any)._unpatch(moduleExports);
+    });
+
     it('should unpatch Agent prototype methods', () => {
       const originalGenerate = vi.fn();
       const originalStream = vi.fn();

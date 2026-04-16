@@ -108,6 +108,19 @@ export class MastraInstrumentation extends InstrumentationBase<MastraInstrumenta
    * Instead, we dynamically require the subpath modules here. Since the
    * root @mastra/core package is already resolved at this point, Node
    * will resolve the subpaths from the same package directory.
+   *
+   * **Limitations:**
+   * - This dynamic `require()` approach only works in CJS contexts. In
+   *   ESM applications, the OTel `import-in-the-middle` hook uses
+   *   `internals: false`, so subpath ESM imports won't trigger the root
+   *   module's patch callback. The root `@mastra/core` ESM import will
+   *   trigger it, but the dynamic `require()` may load the CJS version
+   *   instead of the ESM version. Full ESM support for subpath modules
+   *   would require a different hooking strategy.
+   * - If user code only requires subpath modules and never imports the
+   *   root `@mastra/core`, the patch callback won't fire. In practice
+   *   this is unlikely because Mastra apps always import the `Mastra`
+   *   class from the root entry point.
    */
   private _patch(moduleExports: any): void {
     // Try patching from root exports (works for older versions)
