@@ -420,6 +420,54 @@ describe('GoogleGenAIInstrumentation patching', () => {
     });
   });
 
+  describe('stream span lifecycle', () => {
+    it('should end the span even when the stream is returned but the iterator is never started', async () => {
+      // Regression guard: if a caller gets the stream object but never touches its
+      // asyncIterator (e.g., error in the caller before the for-await loop), the span
+      // must still be ended. Without explicit cleanup, the span leaks permanently.
+      const mockStream = {
+        [Symbol.asyncIterator]() {
+          return {
+            async next() {
+              return {
+                done: false,
+                value: { candidates: [{ content: { parts: [{ text: 'hi' }] } }] },
+              };
+            },
+            async return(val?: any) {
+              return { done: true as const, value: val };
+            },
+          };
+        },
+      };
+
+      mockModelsProto.generateContentStreamInternal = vi.fn().mockResolvedValue(mockStream);
+
+      const definitions = instrumentation.getModuleDefinitions();
+      definitions[0].patch!(
+        { GoogleGenAI: MockGoogleGenAI },
+        '1.0.0',
+      );
+
+      const client = new MockGoogleGenAI({ apiKey: 'test' });
+      // Get the stream object but NEVER iterate it — simulate caller abandoning it
+      const stream = await client.models.generateContentStream({
+        model: 'gemini-2.0-flash',
+        contents: [],
+      });
+      expect(stream).toBeDefined();
+
+      // Without any iteration, the span would be leaked.
+      // Clean up by calling return() on the iterator (what for-await does on break/gc).
+      const iter = stream[Symbol.asyncIterator]();
+      await iter.return?.();
+
+      const spans = exporter.getFinishedSpans();
+      expect(spans.length).toBe(1);
+      expect(spans[0].status.code).toBe(SpanStatusCode.OK);
+    });
+  });
+
   describe('unpatch', () => {
     it('should restore original internal methods on unpatch', () => {
       const originalGenerate = vi.fn();

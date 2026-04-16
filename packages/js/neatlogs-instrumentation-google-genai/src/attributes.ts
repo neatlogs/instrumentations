@@ -120,6 +120,13 @@ export function finalizeStreamAttributes(span: Span, chunks: any[]): void {
     let totalCompletionTokens = 0;
     let totalTokens = 0;
     let finishReason = '';
+    // Track per-field whether the API ever provided a value.
+    // This distinguishes "field explicitly set to 0" from "field absent in all chunks".
+    // Using if(value) would drop legitimate zero counts; using a blanket hasUsageData
+    // flag would write fabricated 0s for fields the API never returned.
+    let hasPromptTokens = false;
+    let hasCompletionTokens = false;
+    let hasTotalTokens = false;
 
     for (const chunk of chunks) {
       if (chunk.candidates?.[0]?.content?.parts) {
@@ -131,12 +138,18 @@ export function finalizeStreamAttributes(span: Span, chunks: any[]): void {
         finishReason = chunk.candidates[0].finishReason;
       }
       if (chunk.usageMetadata) {
-        totalPromptTokens =
-          chunk.usageMetadata.promptTokenCount ?? totalPromptTokens;
-        totalCompletionTokens =
-          chunk.usageMetadata.candidatesTokenCount ?? totalCompletionTokens;
-        totalTokens =
-          chunk.usageMetadata.totalTokenCount ?? totalTokens;
+        if (chunk.usageMetadata.promptTokenCount != null) {
+          totalPromptTokens = chunk.usageMetadata.promptTokenCount;
+          hasPromptTokens = true;
+        }
+        if (chunk.usageMetadata.candidatesTokenCount != null) {
+          totalCompletionTokens = chunk.usageMetadata.candidatesTokenCount;
+          hasCompletionTokens = true;
+        }
+        if (chunk.usageMetadata.totalTokenCount != null) {
+          totalTokens = chunk.usageMetadata.totalTokenCount;
+          hasTotalTokens = true;
+        }
       }
     }
 
@@ -145,21 +158,15 @@ export function finalizeStreamAttributes(span: Span, chunks: any[]): void {
     if (finishReason) {
       span.setAttribute('gen_ai.response.finish_reasons', [finishReason]);
     }
-    if (totalPromptTokens) {
+    if (hasPromptTokens) {
       span.setAttribute('llm.token_count.prompt', totalPromptTokens);
       span.setAttribute('gen_ai.usage.prompt_tokens', totalPromptTokens);
     }
-    if (totalCompletionTokens) {
-      span.setAttribute(
-        'llm.token_count.completion',
-        totalCompletionTokens,
-      );
-      span.setAttribute(
-        'gen_ai.usage.completion_tokens',
-        totalCompletionTokens,
-      );
+    if (hasCompletionTokens) {
+      span.setAttribute('llm.token_count.completion', totalCompletionTokens);
+      span.setAttribute('gen_ai.usage.completion_tokens', totalCompletionTokens);
     }
-    if (totalTokens) {
+    if (hasTotalTokens) {
       span.setAttribute('llm.token_count.total', totalTokens);
     }
   } catch {

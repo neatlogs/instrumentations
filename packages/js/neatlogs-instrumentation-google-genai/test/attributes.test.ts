@@ -398,6 +398,8 @@ describe('finalizeStreamAttributes', () => {
   });
 
   it('should handle chunks with no candidates', () => {
+    // Only totalTokenCount is present — prompt and completion should NOT be set
+    // (writing 0 for absent fields would fabricate data the API never returned).
     const chunks = [{ usageMetadata: { totalTokenCount: 5 } }];
 
     expect(() => {
@@ -405,9 +407,17 @@ describe('finalizeStreamAttributes', () => {
     }).not.toThrow();
 
     expect(mockSpan._attributes['llm.token_count.total']).toBe(5);
+    // Fields absent from usageMetadata must remain unset — not written as 0
+    expect(mockSpan._attributes['llm.token_count.prompt']).toBeUndefined();
+    expect(mockSpan._attributes['llm.token_count.completion']).toBeUndefined();
+    expect(mockSpan._attributes['gen_ai.usage.prompt_tokens']).toBeUndefined();
+    expect(mockSpan._attributes['gen_ai.usage.completion_tokens']).toBeUndefined();
   });
 
-  it('should not ignore zero token counts (uses ?? not ||)', () => {
+  it('should set token counts to 0 when API returns zero (valid data, should not be suppressed)', () => {
+    // When the API explicitly returns 0 for token counts (e.g., a model that reports
+    // zero prompt tokens for a cached request), the attribute should be SET to 0,
+    // not omitted. Zero is a valid data point distinguishable from "no data".
     const chunks = [
       {
         candidates: [{ content: { parts: [{ text: 'test' }] } }],
@@ -421,14 +431,16 @@ describe('finalizeStreamAttributes', () => {
 
     finalizeStreamAttributes(mockSpan as any, chunks);
 
-    // Zero is a valid token count and should not be ignored
-    // Previously used || which treated 0 as falsy; now uses ??
-    expect(mockSpan._attributes['llm.token_count.prompt']).toBeUndefined();
-    expect(mockSpan._attributes['llm.token_count.completion']).toBeUndefined();
-    expect(mockSpan._attributes['llm.token_count.total']).toBeUndefined();
+    expect(mockSpan._attributes['llm.token_count.prompt']).toBe(0);
+    expect(mockSpan._attributes['llm.token_count.completion']).toBe(0);
+    expect(mockSpan._attributes['llm.token_count.total']).toBe(0);
+    expect(mockSpan._attributes['gen_ai.usage.prompt_tokens']).toBe(0);
+    expect(mockSpan._attributes['gen_ai.usage.completion_tokens']).toBe(0);
   });
 
-  it('should use latest non-null token count when zero appears first', () => {
+  it('should use the final chunk token counts even when they override earlier non-zero values', () => {
+    // If chunk1 reports 10 prompt tokens and chunk2 reports 0 (e.g., incremental API),
+    // the last chunk's values (0) should be respected — ?? only skips null/undefined.
     const chunks = [
       {
         candidates: [{ content: { parts: [{ text: 'A' }] } }],
@@ -450,10 +462,10 @@ describe('finalizeStreamAttributes', () => {
 
     finalizeStreamAttributes(mockSpan as any, chunks);
 
-    // The second chunk explicitly sets counts to 0, which should be respected
-    // because ?? only falls through on null/undefined, not on 0
-    expect(mockSpan._attributes['llm.token_count.prompt']).toBeUndefined();
-    expect(mockSpan._attributes['llm.token_count.completion']).toBeUndefined();
-    expect(mockSpan._attributes['llm.token_count.total']).toBeUndefined();
+    // The second chunk's explicit 0 values override chunk1's values via ??
+    // and should be emitted as attributes (0 is valid, not absent).
+    expect(mockSpan._attributes['llm.token_count.prompt']).toBe(0);
+    expect(mockSpan._attributes['llm.token_count.completion']).toBe(0);
+    expect(mockSpan._attributes['llm.token_count.total']).toBe(0);
   });
 });

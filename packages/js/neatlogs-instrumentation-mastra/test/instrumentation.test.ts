@@ -31,17 +31,15 @@ describe('MastraInstrumentation', () => {
   });
 
   it('should return an InstrumentationNodeModuleDefinition from init', () => {
-    const moduleDefs = (instrumentation as any).init();
-    expect(moduleDefs).toBeDefined();
-    expect(moduleDefs.name).toBe('@mastra/core');
-
-    // Subpath module files should be registered for newer Mastra versions
-    expect(moduleDefs.files).toBeDefined();
-    expect(moduleDefs.files.length).toBe(3);
-    const fileNames = moduleDefs.files.map((f: any) => f.name);
-    expect(fileNames).toContain('@mastra/core/agent');
-    expect(fileNames).toContain('@mastra/core/workflows');
-    expect(fileNames).toContain('@mastra/core/tools');
+    const moduleDef = (instrumentation as any).init();
+    expect(moduleDef).toBeDefined();
+    expect(moduleDef.name).toBe('@mastra/core');
+    // No InstrumentationNodeModuleFile entries — subpath modules are
+    // dynamically required inside the root patch callback instead,
+    // because require-in-the-middle resolves subpath imports to internal
+    // file paths (e.g. @mastra/core/dist/agent/index.cjs) that cannot
+    // be reliably matched by InstrumentationNodeModuleFile names.
+    expect(moduleDef.files).toEqual([]);
   });
 
   describe('_getOrCreateSpan', () => {
@@ -219,6 +217,27 @@ describe('MastraInstrumentation', () => {
 
       (instrumentation as any)._unpatchToolsModule(subpathExports);
       expect(subpathExports.createTool).toBe(originalCreateTool);
+    });
+
+    it('should unpatch createTool correctly even when _unpatchToolsModule is called with a DIFFERENT object', () => {
+      // Regression test: _unpatchToolsModule must always unwrap from the stored module
+      // reference (_patchedToolsModule), NOT from its argument. Without this fix, calling
+      // _unpatch(rootExports) when createTool was patched on subpathExports would silently
+      // leave the subpath wrapped — because shimmer's __unwrap closure captures the original
+      // nodule at wrap time, and calling _unwrap(wrongObject, 'createTool') is a no-op.
+      const originalCreateTool = vi.fn();
+      const subpathExports = { createTool: originalCreateTool };
+      const unrelatedExports = { createTool: vi.fn() }; // simulates root module object
+
+      // Patch using subpath object
+      (instrumentation as any)._patchToolsModule(subpathExports);
+      expect(subpathExports.createTool).not.toBe(originalCreateTool); // wrapped
+
+      // Unpatch passing a DIFFERENT object (simulates root-module unpatch callback)
+      // This should still correctly unpatch from the stored subpathExports reference
+      (instrumentation as any)._unpatchToolsModule(unrelatedExports);
+      expect(subpathExports.createTool).toBe(originalCreateTool); // restored ✓
+      expect(unrelatedExports.createTool).not.toBe(originalCreateTool); // untouched ✓
     });
 
     it('should unpatch Agent prototype methods', () => {
@@ -504,6 +523,56 @@ describe('MastraInstrumentation', () => {
       const spans = exporter.getFinishedSpans();
       expect(spans.length).toBe(1);
       expect(spans[0].name).toBe('mastra.agent.stream');
+    });
+
+    it('should end the span when textStream iterator is explicitly closed via return()', async () => {
+      // Regression guard: if a caller gets the stream result but calls return() on the
+      // textStream iterator before consuming all chunks (e.g., a break or early exit),
+      // the span must be properly ended. This covers the for-await break/early-return path.
+      const textChunks = ['Hello', ' world'];
+      let chunkIndex = 0;
+
+      const mockTextStream = {
+        [Symbol.asyncIterator]() {
+          return {
+            async next() {
+              if (chunkIndex < textChunks.length) {
+                return { done: false, value: textChunks[chunkIndex++] };
+              }
+              return { done: true, value: undefined };
+            },
+            async return(val?: any) {
+              return { done: true as const, value: val };
+            },
+          };
+        },
+      };
+
+      const mockAgentInstance = { name: 'EarlyExitAgent' };
+      const originalStream = vi.fn().mockResolvedValue({ textStream: mockTextStream });
+      const mockAgent = {
+        prototype: {
+          stream: originalStream,
+          generate: vi.fn(),
+        },
+      };
+
+      const moduleExports = { Agent: mockAgent };
+      (instrumentation as any)._patch(moduleExports);
+
+      const result = await mockAgent.prototype.stream.call(mockAgentInstance, 'Hi');
+
+      // Get the iterator and call return() without consuming any items
+      // (mirrors what for-await does on an early break/return)
+      const iter = result.textStream[Symbol.asyncIterator]();
+      await iter.return?.();
+
+      const spans = exporter.getFinishedSpans();
+      expect(spans.length).toBe(1);
+      expect(spans[0].name).toBe('mastra.agent.stream');
+      expect(spans[0].status.code).toBe(SpanStatusCode.OK);
+      // Output.value should be set (even with empty accumulated text)
+      expect(spans[0].attributes['openinference.span.kind']).toBe('AGENT');
     });
   });
 

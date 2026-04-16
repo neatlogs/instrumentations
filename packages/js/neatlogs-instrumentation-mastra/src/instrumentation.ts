@@ -1,7 +1,6 @@
 import {
   InstrumentationBase,
   InstrumentationNodeModuleDefinition,
-  InstrumentationNodeModuleFile,
 } from '@opentelemetry/instrumentation';
 import {
   trace,
@@ -24,7 +23,8 @@ const INSTRUMENTATION_VERSION = '0.1.0';
 export class MastraInstrumentation extends InstrumentationBase<MastraInstrumentationConfig> {
   private _agentPrototype: any = null;
   private _workflowPrototype: any = null;
-  private _originalCreateTool: any = null;
+  /** The module-exports object on which createTool was wrapped, for correct unpatch. */
+  private _patchedToolsModule: any = null;
 
   constructor(config: MastraInstrumentationConfig = {}) {
     super(INSTRUMENTATION_NAME, INSTRUMENTATION_VERSION, config);
@@ -81,12 +81,6 @@ export class MastraInstrumentation extends InstrumentationBase<MastraInstrumenta
   }
 
   protected init() {
-    // The root @mastra/core entry point may export Agent, Workflow, and
-    // createTool directly (older versions), so we try patching from there.
-    // In newer versions (e.g. 1.25+), these live under subpath exports:
-    //   @mastra/core/agent, @mastra/core/workflows, @mastra/core/tools
-    // We register InstrumentationNodeModuleFile entries for each subpath
-    // so the OTel hook system intercepts them regardless of layout.
     return new InstrumentationNodeModuleDefinition(
       '@mastra/core',
       ['>=1.0.0'],
@@ -97,52 +91,56 @@ export class MastraInstrumentation extends InstrumentationBase<MastraInstrumenta
       (moduleExports: any) => {
         this._unpatch(moduleExports);
       },
-      [
-        new InstrumentationNodeModuleFile(
-          '@mastra/core/agent',
-          ['>=1.0.0'],
-          (moduleExports: any) => {
-            this._patchAgentModule(moduleExports);
-            return moduleExports;
-          },
-          (moduleExports: any) => {
-            this._unpatchAgentModule(moduleExports);
-          },
-        ),
-        new InstrumentationNodeModuleFile(
-          '@mastra/core/workflows',
-          ['>=1.0.0'],
-          (moduleExports: any) => {
-            this._patchWorkflowModule(moduleExports);
-            return moduleExports;
-          },
-          (moduleExports: any) => {
-            this._unpatchWorkflowModule(moduleExports);
-          },
-        ),
-        new InstrumentationNodeModuleFile(
-          '@mastra/core/tools',
-          ['>=1.0.0'],
-          (moduleExports: any) => {
-            this._patchToolsModule(moduleExports);
-            return moduleExports;
-          },
-          (moduleExports: any) => {
-            this._unpatchToolsModule(moduleExports);
-          },
-        ),
-      ],
     );
   }
 
   /**
-   * Patch the root @mastra/core module (for older versions that export
-   * Agent, Workflow, and createTool from the root entry point).
+   * Patch Agent, Workflow, and createTool.
+   *
+   * Older versions of @mastra/core export everything from the root entry
+   * point, so we first try patching from `moduleExports` directly.
+   *
+   * Newer versions (v1.25+) moved these to subpath exports
+   * (@mastra/core/agent, @mastra/core/workflows, @mastra/core/tools).
+   * The OTel require-in-the-middle hook resolves subpath imports to
+   * internal file paths (e.g. @mastra/core/dist/agent/index.cjs) which
+   * cannot be reliably matched by InstrumentationNodeModuleFile names.
+   * Instead, we dynamically require the subpath modules here. Since the
+   * root @mastra/core package is already resolved at this point, Node
+   * will resolve the subpaths from the same package directory.
    */
   private _patch(moduleExports: any): void {
+    // Try patching from root exports (works for older versions)
     this._patchAgentModule(moduleExports);
     this._patchWorkflowModule(moduleExports);
     this._patchToolsModule(moduleExports);
+
+    // For newer versions where classes live in subpath exports,
+    // dynamically require and patch each subpath module.
+    if (!moduleExports?.Agent) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        this._patchAgentModule(require('@mastra/core/agent'));
+      } catch {
+        // Subpath not available — skip
+      }
+    }
+    if (!moduleExports?.Workflow) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        this._patchWorkflowModule(require('@mastra/core/workflows'));
+      } catch {
+        // Subpath not available — skip
+      }
+    }
+    if (!moduleExports?.createTool) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        this._patchToolsModule(require('@mastra/core/tools'));
+      } catch {
+        // Subpath not available — skip
+      }
+    }
   }
 
   private _unpatch(moduleExports: any): void {
@@ -212,15 +210,18 @@ export class MastraInstrumentation extends InstrumentationBase<MastraInstrumenta
    */
   private _patchToolsModule(moduleExports: any): void {
     if (typeof moduleExports?.createTool === 'function') {
-      this._originalCreateTool = moduleExports.createTool;
+      // Store the module reference (not the original fn) so _unpatchToolsModule always
+      // unwraps from the exact object that was wrapped — avoids mismatched-object bugs
+      // when root and subpath exports are different objects.
+      this._patchedToolsModule = moduleExports;
       this._wrap(moduleExports, 'createTool', this._patchCreateToolFn());
     }
   }
 
-  private _unpatchToolsModule(moduleExports?: any): void {
-    if (moduleExports && this._originalCreateTool) {
-      this._unwrap(moduleExports, 'createTool');
-      this._originalCreateTool = null;
+  private _unpatchToolsModule(_moduleExports?: any): void {
+    if (this._patchedToolsModule) {
+      this._unwrap(this._patchedToolsModule, 'createTool');
+      this._patchedToolsModule = null;
     }
   }
 
