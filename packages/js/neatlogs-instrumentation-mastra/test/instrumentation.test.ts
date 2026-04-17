@@ -1,766 +1,501 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { trace, context, SpanStatusCode } from '@opentelemetry/api';
-import {
-  InMemorySpanExporter,
-  SimpleSpanProcessor,
-} from '@opentelemetry/sdk-trace-base';
-import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
-import { MastraInstrumentation } from '../src/instrumentation.js';
+import type { TracerProvider, Span } from '@opentelemetry/api';
+import { SpanStatusCode } from '@opentelemetry/api';
+import { MastraInstrumentor } from '../src/instrumentation.js';
 
-describe('MastraInstrumentation', () => {
-  let instrumentation: MastraInstrumentation;
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function createMockSpan(): Span & {
+  _attributes: Record<string, any>;
+  _status: any;
+  _ended: boolean;
+  _endTime: number | undefined;
+  _exceptions: any[];
+} {
+  const attrs: Record<string, any> = {};
+  const span = {
+    _attributes: attrs,
+    _status: null as any,
+    _ended: false,
+    _endTime: undefined as number | undefined,
+    _exceptions: [] as any[],
+    setAttribute: vi.fn((key: string, value: any) => {
+      attrs[key] = value;
+      return span;
+    }),
+    setStatus: vi.fn((status: any) => {
+      span._status = status;
+      return span;
+    }),
+    end: vi.fn((endTime?: number) => {
+      span._ended = true;
+      span._endTime = endTime;
+    }),
+    recordException: vi.fn((err: any) => {
+      span._exceptions.push(err);
+    }),
+    spanContext: vi.fn(() => ({
+      traceId: '0'.repeat(32),
+      spanId: '0'.repeat(16),
+      traceFlags: 1,
+    })),
+    isRecording: vi.fn(() => true),
+    updateName: vi.fn(() => span),
+    addEvent: vi.fn(() => span),
+    addLink: vi.fn(() => span),
+    addLinks: vi.fn(() => span),
+  };
+  return span as any;
+}
+
+function createMockTracerProvider(mockSpan: Span): TracerProvider {
+  return {
+    getTracer: vi.fn(() => ({
+      startSpan: vi.fn((_name: string, _opts?: any, _ctx?: any) => mockSpan),
+      startActiveSpan: vi.fn(
+        (_name: string, _opts: any, fn: (span: Span) => any) => fn(mockSpan),
+      ),
+    })),
+  } as unknown as TracerProvider;
+}
+
+/** Build a minimal AnyExportedSpan-shaped object for testing. */
+function makeSpan(overrides: Record<string, any> = {}): any {
+  return {
+    id: 'span-1',
+    traceId: 'trace-1',
+    name: 'test.span',
+    type: 'agent_run',
+    startTime: new Date('2024-01-01T00:00:00Z'),
+    endTime: new Date('2024-01-01T00:00:01Z'),
+    isEvent: false,
+    isRootSpan: true,
+    attributes: {},
+    ...overrides,
+  };
+}
+
+/** Build a TracingEvent with type=span_ended wrapping the given span. */
+function makeEvent(span: any): any {
+  return { type: 'span_ended', exportedSpan: span };
+}
+
+/** Create a mock @mastra/core module with a Mastra constructor. */
+function createMockMastraModule() {
+  function Mastra(this: any, config?: any) {
+    this.config = config ?? {};
+  }
+  Mastra.prototype.getAgent = vi.fn();
+  return { Mastra };
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe('MastraInstrumentor', () => {
+  let instrumentor: MastraInstrumentor;
+  let mockSpan: ReturnType<typeof createMockSpan>;
+  let provider: TracerProvider;
+  let mockModule: ReturnType<typeof createMockMastraModule>;
 
   beforeEach(() => {
-    instrumentation = new MastraInstrumentation();
+    instrumentor = new MastraInstrumentor();
+    mockSpan = createMockSpan();
+    provider = createMockTracerProvider(mockSpan);
+    mockModule = createMockMastraModule();
   });
 
   afterEach(() => {
-    instrumentation.disable();
+    instrumentor.disable();
+    vi.restoreAllMocks();
   });
 
-  it('should instantiate with default config', () => {
-    expect(instrumentation).toBeDefined();
-    expect(instrumentation.instrumentationName).toBe('@neatlogs/instrumentation-mastra');
-    expect(instrumentation.instrumentationVersion).toBe('0.1.0');
+  // -------------------------------------------------------------------------
+  // instrument() basics
+  // -------------------------------------------------------------------------
+
+  describe('instrument()', () => {
+    it('should gracefully no-op when Mastra class is missing from the module', () => {
+      expect(() =>
+        instrumentor.instrument({ tracerProvider: provider, _module: {} }),
+      ).not.toThrow();
+    });
+
+    it('should patch the Mastra constructor', () => {
+      const origMastra = mockModule.Mastra;
+      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
+      expect(mockModule.Mastra).not.toBe(origMastra);
+    });
   });
 
-  it('should instantiate with custom config', () => {
-    const customInstrumentation = new MastraInstrumentation({ enabled: false });
-    expect(customInstrumentation).toBeDefined();
-    customInstrumentation.disable();
-  });
+  // -------------------------------------------------------------------------
+  // Mastra constructor injection
+  // -------------------------------------------------------------------------
 
-  it('should return an InstrumentationNodeModuleDefinition from init', () => {
-    const moduleDef = (instrumentation as any).init();
-    expect(moduleDef).toBeDefined();
-    expect(moduleDef.name).toBe('@mastra/core');
-    // No InstrumentationNodeModuleFile entries — subpath modules are
-    // dynamically required inside the root patch callback instead,
-    // because require-in-the-middle resolves subpath imports to internal
-    // file paths (e.g. @mastra/core/dist/agent/index.cjs) that cannot
-    // be reliably matched by InstrumentationNodeModuleFile names.
-    expect(moduleDef.files).toEqual([]);
-  });
+  describe('Mastra constructor injection', () => {
+    it('should inject exporter into observability config when none provided', () => {
+      const mockExporter = { name: 'neatlogs', exportTracingEvent: vi.fn() };
 
-  describe('_getOrCreateSpan', () => {
-    let provider: NodeTracerProvider;
-    let exporter: InMemorySpanExporter;
-
-    beforeEach(() => {
-      exporter = new InMemorySpanExporter();
-      provider = new NodeTracerProvider();
-      provider.addSpanProcessor(new SimpleSpanProcessor(exporter));
-      provider.register();
-      instrumentation.setTracerProvider(provider);
-    });
-
-    afterEach(async () => {
-      exporter.reset();
-      await provider.shutdown();
-    });
-
-    it('should create a new span when no active span exists', async () => {
-      const result = await (instrumentation as any)._getOrCreateSpan(
-        'test.span',
-        async (span: any) => {
-          span.setAttribute('test.attr', 'value');
-          return 'result';
-        },
-      );
-
-      expect(result).toBe('result');
-      const spans = exporter.getFinishedSpans();
-      expect(spans.length).toBe(1);
-      expect(spans[0].name).toBe('test.span');
-      expect(spans[0].status.code).toBe(SpanStatusCode.OK);
-    });
-
-    it('should record error when fn throws and no active span', async () => {
-      const error = new Error('test error');
-      await expect(
-        (instrumentation as any)._getOrCreateSpan(
-          'test.error.span',
-          async () => {
-            throw error;
-          },
-        ),
-      ).rejects.toThrow('test error');
-
-      const spans = exporter.getFinishedSpans();
-      expect(spans.length).toBe(1);
-      expect(spans[0].status.code).toBe(SpanStatusCode.ERROR);
-      expect(spans[0].status.message).toBe('test error');
-      expect(spans[0].events.length).toBe(1); // exception event
-    });
-
-    it('should enrich existing active span when one exists', async () => {
-      const tracer = provider.getTracer('test');
-
-      const spansBeforeTest = exporter.getFinishedSpans().length;
-
-      let innerResult: string | undefined;
-      await tracer.startActiveSpan('parent.span', async (parentSpan) => {
-        innerResult = await (instrumentation as any)._getOrCreateSpan(
-          'should.not.be.used',
-          async (span: any) => {
-            span.setAttribute('enriched.attr', 'enriched-value');
-            return 'enriched-result';
-          },
-        );
-        parentSpan.end();
+      instrumentor.instrument({
+        tracerProvider: provider,
+        _module: mockModule,
+        _exporter: mockExporter,
       });
 
-      expect(innerResult).toBe('enriched-result');
+      const instance = new (mockModule.Mastra as any)({ agents: {} });
 
-      const spans = exporter.getFinishedSpans();
-      // Only 1 new span should have been created (the parent)
-      // _getOrCreateSpan should NOT create a new one since activeSpan exists
-      const newSpans = spans.slice(spansBeforeTest);
-      expect(newSpans.length).toBe(1);
-      expect(newSpans[0].name).toBe('parent.span');
-      // The enriched attribute should be on the parent span
-      expect(newSpans[0].attributes['enriched.attr']).toBe('enriched-value');
-    });
-  });
-
-  describe('patching', () => {
-    it('should patch Agent.prototype.generate', () => {
-      const originalGenerate = vi.fn();
-      const mockAgent = {
-        prototype: {
-          generate: originalGenerate,
+      expect(instance.config.observability).toEqual({
+        configs: {
+          default: {
+            serviceName: 'mastra',
+            exporters: [mockExporter],
+          },
         },
-      };
-      const moduleExports = { Agent: mockAgent };
-      (instrumentation as any)._patch(moduleExports);
-
-      // The generate function should have been wrapped (not the same reference)
-      expect(mockAgent.prototype.generate).not.toBe(originalGenerate);
-    });
-
-    it('should patch Workflow.prototype.execute', () => {
-      const originalExecute = vi.fn();
-      const mockWorkflow = {
-        prototype: {
-          execute: originalExecute,
-        },
-      };
-      const moduleExports = { Workflow: mockWorkflow };
-      (instrumentation as any)._patch(moduleExports);
-
-      expect(mockWorkflow.prototype.execute).not.toBe(originalExecute);
-    });
-
-    it('should patch createTool', () => {
-      const originalCreateTool = vi.fn();
-      const moduleExports = { createTool: originalCreateTool };
-      (instrumentation as any)._patch(moduleExports);
-
-      expect(moduleExports.createTool).not.toBe(originalCreateTool);
-    });
-
-    it('should handle missing Agent gracefully', () => {
-      const moduleExports = {};
-      expect(() => (instrumentation as any)._patch(moduleExports)).not.toThrow();
-    });
-
-    it('should handle missing Workflow gracefully', () => {
-      const moduleExports = {};
-      expect(() => (instrumentation as any)._patch(moduleExports)).not.toThrow();
-    });
-
-    it('should handle missing createTool gracefully', () => {
-      const moduleExports = {};
-      expect(() => (instrumentation as any)._patch(moduleExports)).not.toThrow();
-    });
-
-    it('should patch Agent from subpath module (@mastra/core/agent)', () => {
-      const originalGenerate = vi.fn();
-      const mockAgent = {
-        prototype: {
-          generate: originalGenerate,
-        },
-      };
-      // Simulate the subpath module exporting Agent
-      const subpathExports = { Agent: mockAgent };
-      (instrumentation as any)._patchAgentModule(subpathExports);
-
-      expect(mockAgent.prototype.generate).not.toBe(originalGenerate);
-
-      // Clean up
-      (instrumentation as any)._unpatchAgentModule(subpathExports);
-      expect(mockAgent.prototype.generate).toBe(originalGenerate);
-    });
-
-    it('should patch Workflow from subpath module (@mastra/core/workflows)', () => {
-      const originalExecute = vi.fn();
-      const mockWorkflow = {
-        prototype: {
-          execute: originalExecute,
-        },
-      };
-      const subpathExports = { Workflow: mockWorkflow };
-      (instrumentation as any)._patchWorkflowModule(subpathExports);
-
-      expect(mockWorkflow.prototype.execute).not.toBe(originalExecute);
-
-      (instrumentation as any)._unpatchWorkflowModule(subpathExports);
-      expect(mockWorkflow.prototype.execute).toBe(originalExecute);
-    });
-
-    it('should patch createTool from subpath module (@mastra/core/tools)', () => {
-      const originalCreateTool = vi.fn();
-      const subpathExports = { createTool: originalCreateTool };
-      (instrumentation as any)._patchToolsModule(subpathExports);
-
-      expect(subpathExports.createTool).not.toBe(originalCreateTool);
-
-      (instrumentation as any)._unpatchToolsModule(subpathExports);
-      expect(subpathExports.createTool).toBe(originalCreateTool);
-    });
-
-    it('should unpatch createTool correctly even when _unpatchToolsModule is called with a DIFFERENT object', () => {
-      // Regression test: _unpatchToolsModule must always unwrap from the stored module
-      // reference (_patchedToolsModule), NOT from its argument. Without this fix, calling
-      // _unpatch(rootExports) when createTool was patched on subpathExports would silently
-      // leave the subpath wrapped — because shimmer's __unwrap closure captures the original
-      // nodule at wrap time, and calling _unwrap(wrongObject, 'createTool') is a no-op.
-      const originalCreateTool = vi.fn();
-      const subpathExports = { createTool: originalCreateTool };
-      const unrelatedExports = { createTool: vi.fn() }; // simulates root module object
-
-      // Patch using subpath object
-      (instrumentation as any)._patchToolsModule(subpathExports);
-      expect(subpathExports.createTool).not.toBe(originalCreateTool); // wrapped
-
-      // Unpatch passing a DIFFERENT object (simulates root-module unpatch callback)
-      // This should still correctly unpatch from the stored subpathExports reference
-      (instrumentation as any)._unpatchToolsModule(unrelatedExports);
-      expect(subpathExports.createTool).toBe(originalCreateTool); // restored ✓
-      expect(unrelatedExports.createTool).not.toBe(originalCreateTool); // untouched ✓
-    });
-
-    it('should attempt dynamic require fallback when root exports lack classes', () => {
-      // When moduleExports (root @mastra/core) doesn't have Agent, Workflow,
-      // or createTool, _patch() enters the dynamic-require fallback branches.
-      // Since @mastra/core IS installed as a dev dependency, the require()
-      // calls succeed and the real subpath modules get patched. We verify
-      // that the fallback path fires by checking that prototypes are stored
-      // from the dynamically-required modules.
-      //
-      // NOTE: This test depends on @mastra/core being available as a
-      // devDependency. If the dependency is removed or its subpath exports
-      // change, this test may need updating.
-      const emptyExports = {};
-      (instrumentation as any)._patch(emptyExports);
-
-      // The dynamic require loaded the real @mastra/core subpath modules
-      // and patched them, so the prototype references should be set.
-      expect((instrumentation as any)._agentPrototype).not.toBeNull();
-      expect((instrumentation as any)._workflowPrototype).not.toBeNull();
-      expect((instrumentation as any)._patchedToolsModule).not.toBeNull();
-
-      // Clean up: unpatch the real modules
-      (instrumentation as any)._unpatch(emptyExports);
-    });
-
-    it('should skip dynamic require when root exports already contain Agent', () => {
-      // When root exports have Agent, the dynamic require for @mastra/core/agent
-      // should NOT fire. We verify by checking that _agentPrototype is set from
-      // the root exports object.
-      const originalGenerate = vi.fn();
-      const mockAgent = {
-        prototype: { generate: originalGenerate, stream: vi.fn() },
-      };
-      const moduleExports = { Agent: mockAgent };
-
-      (instrumentation as any)._patch(moduleExports);
-
-      // _agentPrototype should point to the root export's prototype
-      expect((instrumentation as any)._agentPrototype).toBe(mockAgent.prototype);
-      expect(mockAgent.prototype.generate).not.toBe(originalGenerate);
-
-      (instrumentation as any)._unpatch(moduleExports);
-    });
-
-    it('should skip dynamic require when root exports already contain Workflow', () => {
-      const originalExecute = vi.fn();
-      const mockWorkflow = {
-        prototype: { execute: originalExecute },
-      };
-      const moduleExports = { Workflow: mockWorkflow };
-
-      (instrumentation as any)._patch(moduleExports);
-
-      expect((instrumentation as any)._workflowPrototype).toBe(mockWorkflow.prototype);
-      expect(mockWorkflow.prototype.execute).not.toBe(originalExecute);
-
-      (instrumentation as any)._unpatch(moduleExports);
-    });
-
-    it('should skip dynamic require when root exports already contain createTool', () => {
-      const originalCreateTool = vi.fn().mockReturnValue({
-        id: 'tool1',
-        execute: vi.fn().mockResolvedValue({}),
       });
-      const moduleExports = { createTool: originalCreateTool };
-
-      (instrumentation as any)._patch(moduleExports);
-
-      expect((instrumentation as any)._patchedToolsModule).toBe(moduleExports);
-      expect(moduleExports.createTool).not.toBe(originalCreateTool);
-
-      (instrumentation as any)._unpatch(moduleExports);
     });
 
-    it('should unpatch Agent prototype methods', () => {
-      const originalGenerate = vi.fn();
-      const originalStream = vi.fn();
-      const mockAgent = {
-        prototype: {
-          generate: originalGenerate,
-          stream: originalStream,
-        },
-      };
-      const moduleExports = { Agent: mockAgent };
-      (instrumentation as any)._patch(moduleExports);
-      (instrumentation as any)._unpatch(moduleExports);
+    it('should NOT override user-configured observability', () => {
+      const mockExporter = { name: 'neatlogs', exportTracingEvent: vi.fn() };
+      const userObservability = { custom: true };
 
-      // After unpatching, functions should be restored
-      expect(mockAgent.prototype.generate).toBe(originalGenerate);
-      expect(mockAgent.prototype.stream).toBe(originalStream);
+      instrumentor.instrument({
+        tracerProvider: provider,
+        _module: mockModule,
+        _exporter: mockExporter,
+      });
+
+      const instance = new (mockModule.Mastra as any)({
+        agents: {},
+        observability: userObservability,
+      });
+
+      expect(instance.config.observability).toBe(userObservability);
     });
 
-    it('should unpatch Workflow prototype methods', () => {
-      const originalExecute = vi.fn();
-      const mockWorkflow = {
-        prototype: {
-          execute: originalExecute,
-        },
-      };
-      const moduleExports = { Workflow: mockWorkflow };
-      (instrumentation as any)._patch(moduleExports);
-      (instrumentation as any)._unpatch(moduleExports);
+    it('should preserve other config properties when injecting exporter', () => {
+      const mockExporter = { name: 'neatlogs', exportTracingEvent: vi.fn() };
 
-      expect(mockWorkflow.prototype.execute).toBe(originalExecute);
-    });
-  });
+      instrumentor.instrument({
+        tracerProvider: provider,
+        _module: mockModule,
+        _exporter: mockExporter,
+      });
 
-  describe('Agent.generate patch behavior', () => {
-    let provider: NodeTracerProvider;
-    let exporter: InMemorySpanExporter;
+      const instance = new (mockModule.Mastra as any)({
+        agents: { myAgent: 'agent-ref' },
+        logger: false,
+      });
 
-    beforeEach(() => {
-      exporter = new InMemorySpanExporter();
-      provider = new NodeTracerProvider();
-      provider.addSpanProcessor(new SimpleSpanProcessor(exporter));
-      provider.register();
-      instrumentation.setTracerProvider(provider);
+      expect(instance.config.agents).toEqual({ myAgent: 'agent-ref' });
+      expect(instance.config.logger).toBe(false);
+      expect(instance.config.observability).toBeDefined();
     });
 
-    afterEach(async () => {
-      exporter.reset();
-      await provider.shutdown();
-    });
+    it('should use exporters array (not bridge) in the injected config', () => {
+      const mockExporter = { name: 'neatlogs', exportTracingEvent: vi.fn() };
 
-    it('should wrap agent.generate and set attributes', async () => {
-      const generateResult = {
-        text: 'Hello, world!',
-        usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 },
-      };
+      instrumentor.instrument({
+        tracerProvider: provider,
+        _module: mockModule,
+        _exporter: mockExporter,
+      });
 
-      const mockAgentInstance = {
-        name: 'TestAgent',
-        instructions: 'Be helpful',
-        model: { modelId: 'gpt-4' },
-        tools: { search: {}, calc: {} },
-      };
+      const instance = new (mockModule.Mastra as any)({});
+      const defaultConfig = instance.config.observability?.configs?.default;
 
-      const originalGenerate = vi.fn().mockResolvedValue(generateResult);
-      const mockAgent = {
-        prototype: {
-          generate: originalGenerate,
-        },
-      };
-
-      const moduleExports = { Agent: mockAgent };
-      (instrumentation as any)._patch(moduleExports);
-
-      // Call the patched generate with the agent as 'this'
-      const result = await mockAgent.prototype.generate.call(
-        mockAgentInstance,
-        'What is 2+2?',
-      );
-
-      expect(result).toEqual(generateResult);
-      expect(originalGenerate).toHaveBeenCalledWith('What is 2+2?');
-
-      const spans = exporter.getFinishedSpans();
-      expect(spans.length).toBe(1);
-      expect(spans[0].name).toBe('mastra.agent.generate');
-      expect(spans[0].attributes['openinference.span.kind']).toBe('AGENT');
-      expect(spans[0].attributes['agent.name']).toBe('TestAgent');
-      expect(spans[0].attributes['llm.model_name']).toBe('gpt-4');
-      expect(spans[0].attributes['input.value']).toBe('"What is 2+2?"');
-      expect(spans[0].attributes['output.value']).toBe('Hello, world!');
-      expect(spans[0].attributes['llm.token_count.prompt']).toBe(10);
-      expect(spans[0].attributes['llm.token_count.completion']).toBe(5);
-      expect(spans[0].attributes['llm.token_count.total']).toBe(15);
+      expect(defaultConfig).toBeDefined();
+      expect(Array.isArray(defaultConfig.exporters)).toBe(true);
+      expect(defaultConfig.exporters).toContain(mockExporter);
+      expect(defaultConfig.bridge).toBeUndefined();
     });
   });
 
-  describe('Agent.stream patch behavior', () => {
-    let provider: NodeTracerProvider;
-    let exporter: InMemorySpanExporter;
+  // -------------------------------------------------------------------------
+  // NeatlogsMastraExporter — span conversion
+  // -------------------------------------------------------------------------
 
-    beforeEach(() => {
-      exporter = new InMemorySpanExporter();
-      provider = new NodeTracerProvider();
-      provider.addSpanProcessor(new SimpleSpanProcessor(exporter));
-      provider.register();
-      instrumentation.setTracerProvider(provider);
+  describe('NeatlogsMastraExporter (via real exporter injection)', () => {
+    it('should ignore non-span_ended events', async () => {
+      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
+
+      const instance = new (mockModule.Mastra as any)({});
+      const exporter = instance.config.observability.configs.default.exporters[0];
+
+      await exporter.exportTracingEvent({ type: 'span_started', exportedSpan: makeSpan() });
+      await exporter.exportTracingEvent({ type: 'span_updated', exportedSpan: makeSpan() });
+
+      const tracer = (provider.getTracer as any).mock.results[0]?.value;
+      expect(tracer?.startSpan).not.toHaveBeenCalled();
     });
 
-    afterEach(async () => {
-      exporter.reset();
-      await provider.shutdown();
-    });
+    it('should create an OTel span for span_ended events', async () => {
+      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
+      const instance = new (mockModule.Mastra as any)({});
+      const exporter = instance.config.observability.configs.default.exporters[0];
 
-    it('should wrap agent.stream and set attributes after consuming textStream', async () => {
-      const textChunks = ['Hello', ', ', 'world', '!'];
-      let chunkIndex = 0;
+      await exporter.exportTracingEvent(makeEvent(makeSpan({ type: 'agent_run', name: 'my.agent' })));
 
-      const mockTextStream = {
-        [Symbol.asyncIterator]() {
-          return {
-            async next() {
-              if (chunkIndex < textChunks.length) {
-                return { done: false, value: textChunks[chunkIndex++] };
-              }
-              return { done: true, value: undefined };
-            },
-          };
-        },
-      };
-
-      const streamResult = {
-        textStream: mockTextStream,
-        usage: { promptTokens: 20, completionTokens: 10, totalTokens: 30 },
-      };
-
-      const mockAgentInstance = {
-        name: 'StreamAgent',
-        instructions: 'Stream responses',
-        model: { modelId: 'gpt-4o' },
-        tools: {},
-      };
-
-      const originalStream = vi.fn().mockResolvedValue(streamResult);
-      const mockAgent = {
-        prototype: {
-          stream: originalStream,
-          generate: vi.fn(), // needed so _patch doesn't skip Agent
-        },
-      };
-
-      const moduleExports = { Agent: mockAgent };
-      (instrumentation as any)._patch(moduleExports);
-
-      const result = await mockAgent.prototype.stream.call(
-        mockAgentInstance,
-        'Tell me a story',
+      const tracer = (provider.getTracer as any).mock.results[0]?.value;
+      expect(tracer.startSpan).toHaveBeenCalledWith(
+        'my.agent',
+        expect.any(Object),
+        expect.anything(),
       );
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('openinference.span.kind', 'AGENT');
+    });
 
-      // Consume the wrapped textStream
-      const collectedChunks: string[] = [];
-      for await (const chunk of result.textStream) {
-        collectedChunks.push(chunk);
+    it('should set span kind correctly for each SpanType', async () => {
+      const cases: Array<[string, string]> = [
+        ['model_generation', 'LLM'],
+        ['model_step', 'LLM'],
+        ['tool_call', 'TOOL'],
+        ['mcp_tool_call', 'TOOL'],
+        ['agent_run', 'AGENT'],
+        ['workflow_run', 'WORKFLOW'],
+        ['workflow_step', 'CHAIN'],
+        ['rag_ingestion', 'RETRIEVER'],
+        ['rag_embedding', 'EMBEDDING'],
+        ['generic', 'CHAIN'],
+      ];
+
+      for (const [spanType, expectedKind] of cases) {
+        const localSpan = createMockSpan();
+        const localProvider: TracerProvider = {
+          getTracer: vi.fn(() => ({
+            startSpan: vi.fn(() => localSpan),
+          })),
+        } as any;
+
+        const localInstrumentor = new MastraInstrumentor();
+        const localModule = createMockMastraModule();
+        localInstrumentor.instrument({ tracerProvider: localProvider, _module: localModule });
+
+        const inst = new (localModule.Mastra as any)({});
+        const exp = inst.config.observability.configs.default.exporters[0];
+        await exp.exportTracingEvent(makeEvent(makeSpan({ type: spanType })));
+
+        expect(localSpan.setAttribute).toHaveBeenCalledWith('openinference.span.kind', expectedKind);
+        localInstrumentor.disable();
       }
-
-      expect(collectedChunks).toEqual(textChunks);
-
-      const spans = exporter.getFinishedSpans();
-      expect(spans.length).toBe(1);
-      expect(spans[0].name).toBe('mastra.agent.stream');
-      expect(spans[0].attributes['openinference.span.kind']).toBe('AGENT');
-      expect(spans[0].attributes['agent.name']).toBe('StreamAgent');
-      expect(spans[0].attributes['llm.model_name']).toBe('gpt-4o');
-      expect(spans[0].attributes['input.value']).toBe('"Tell me a story"');
-      // After stream consumption, output.value should contain accumulated text
-      expect(spans[0].attributes['output.value']).toBe('Hello, world!');
-      expect(spans[0].attributes['llm.token_count.prompt']).toBe(20);
-      expect(spans[0].attributes['llm.token_count.completion']).toBe(10);
-      expect(spans[0].attributes['llm.token_count.total']).toBe(30);
     });
 
-    it('should enrich but NOT end a borrowed active span during stream consumption', async () => {
-      const textChunks = ['Hi', ' there'];
-      let chunkIndex = 0;
+    it('should set LLM attributes for model_generation spans', async () => {
+      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
+      const instance = new (mockModule.Mastra as any)({});
+      const exporter = instance.config.observability.configs.default.exporters[0];
 
-      const mockTextStream = {
-        [Symbol.asyncIterator]() {
-          return {
-            async next() {
-              if (chunkIndex < textChunks.length) {
-                return { done: false, value: textChunks[chunkIndex++] };
-              }
-              return { done: true, value: undefined };
-            },
-          };
+      await exporter.exportTracingEvent(makeEvent(makeSpan({
+        type: 'model_generation',
+        attributes: {
+          model: 'gpt-4o',
+          provider: 'openai',
+          finishReason: 'stop',
+          usage: {
+            inputTokens: 100,
+            outputTokens: 50,
+            inputDetails: { cacheRead: 10, cacheWrite: 5 },
+            outputDetails: { reasoning: 20 },
+          },
         },
-      };
+      })));
 
-      const streamResult = {
-        textStream: mockTextStream,
-        usage: { promptTokens: 5, completionTokens: 3, totalTokens: 8 },
-      };
-
-      const mockAgentInstance = {
-        name: 'BorrowedSpanAgent',
-        model: { modelId: 'gpt-4o' },
-        tools: {},
-      };
-
-      const originalStream = vi.fn().mockResolvedValue(streamResult);
-      const mockAgent = {
-        prototype: {
-          stream: originalStream,
-          generate: vi.fn(),
-        },
-      };
-
-      const moduleExports = { Agent: mockAgent };
-      (instrumentation as any)._patch(moduleExports);
-
-      // Create an active span to simulate Mastra's OtelBridge
-      const tracer = provider.getTracer('test');
-      const otelBridgeSpan = tracer.startSpan('mastra.otelbridge.agent');
-      const ctx = trace.setSpan(context.active(), otelBridgeSpan);
-
-      // Call stream within the active span context
-      const result = await context.with(ctx, async () => {
-        return mockAgent.prototype.stream.call(mockAgentInstance, 'Hello');
-      });
-
-      // Consume the wrapped textStream within the same context
-      const collectedChunks: string[] = [];
-      await context.with(ctx, async () => {
-        for await (const chunk of result.textStream) {
-          collectedChunks.push(chunk);
-        }
-      });
-
-      expect(collectedChunks).toEqual(textChunks);
-
-      // The OtelBridge span should still be recording (not ended by our instrumentation)
-      expect(otelBridgeSpan.isRecording()).toBe(true);
-
-      // But attributes should have been set on it
-      // End it manually now so it shows up in the exporter
-      otelBridgeSpan.end();
-
-      const spans = exporter.getFinishedSpans();
-      const bridgeSpan = spans.find(s => s.name === 'mastra.otelbridge.agent');
-      expect(bridgeSpan).toBeDefined();
-      expect(bridgeSpan!.attributes['openinference.span.kind']).toBe('AGENT');
-      expect(bridgeSpan!.attributes['agent.name']).toBe('BorrowedSpanAgent');
-      expect(bridgeSpan!.attributes['output.value']).toBe('Hi there');
-
-      // No additional span should have been created by the instrumentation
-      const agentStreamSpans = spans.filter(s => s.name === 'mastra.agent.stream');
-      expect(agentStreamSpans.length).toBe(0);
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('llm.model_name', 'gpt-4o');
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('gen_ai.system', 'openai');
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('llm.response.finish_reason', 'stop');
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('llm.token_count.prompt', 100);
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('llm.token_count.completion', 50);
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('llm.token_count.total', 150);
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('llm.token_count.prompt_details.cache_read', 10);
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('llm.token_count.prompt_details.cache_write', 5);
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('llm.token_count.completion_details.reasoning', 20);
     });
 
-    it('should handle stream result without textStream gracefully', async () => {
-      const streamResult = { text: 'direct response' };
+    it('should flatten input messages to indexed attributes for LLM spans', async () => {
+      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
+      const instance = new (mockModule.Mastra as any)({});
+      const exporter = instance.config.observability.configs.default.exporters[0];
 
-      const mockAgentInstance = { name: 'NoStreamAgent' };
-      const originalStream = vi.fn().mockResolvedValue(streamResult);
-      const mockAgent = {
-        prototype: {
-          stream: originalStream,
-          generate: vi.fn(),
-        },
-      };
+      await exporter.exportTracingEvent(makeEvent(makeSpan({
+        type: 'model_generation',
+        input: [
+          { role: 'system', content: 'You are helpful.' },
+          { role: 'user', content: 'Hello!' },
+        ],
+        output: [
+          { role: 'assistant', content: 'Hi there!' },
+        ],
+      })));
 
-      const moduleExports = { Agent: mockAgent };
-      (instrumentation as any)._patch(moduleExports);
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('llm.input_messages.0.message.role', 'system');
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('llm.input_messages.0.message.content', 'You are helpful.');
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('llm.input_messages.1.message.role', 'user');
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('llm.input_messages.1.message.content', 'Hello!');
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('llm.output_messages.0.message.role', 'assistant');
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('llm.output_messages.0.message.content', 'Hi there!');
+    });
 
-      const result = await mockAgent.prototype.stream.call(
-        mockAgentInstance,
-        'Hello',
+    it('should flatten tool calls in output messages', async () => {
+      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
+      const instance = new (mockModule.Mastra as any)({});
+      const exporter = instance.config.observability.configs.default.exporters[0];
+
+      await exporter.exportTracingEvent(makeEvent(makeSpan({
+        type: 'model_generation',
+        output: [
+          {
+            role: 'assistant',
+            content: '',
+            toolCalls: [
+              { toolName: 'get_weather', args: { city: 'NYC' } },
+            ],
+          },
+        ],
+      })));
+
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+        'llm.output_messages.0.message.tool_calls.0.tool_call.function.name',
+        'get_weather',
       );
-
-      expect(result).toEqual(streamResult);
-
-      const spans = exporter.getFinishedSpans();
-      expect(spans.length).toBe(1);
-      expect(spans[0].name).toBe('mastra.agent.stream');
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+        'llm.output_messages.0.message.tool_calls.0.tool_call.function.arguments',
+        JSON.stringify({ city: 'NYC' }),
+      );
     });
 
-    it('should end the span when textStream iterator is explicitly closed via return()', async () => {
-      // Regression guard: if a caller gets the stream result but calls return() on the
-      // textStream iterator before consuming all chunks (e.g., a break or early exit),
-      // the span must be properly ended. This covers the for-await break/early-return path.
-      const textChunks = ['Hello', ' world'];
-      let chunkIndex = 0;
+    it('should set input.value / output.value for non-LLM spans', async () => {
+      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
+      const instance = new (mockModule.Mastra as any)({});
+      const exporter = instance.config.observability.configs.default.exporters[0];
 
-      const mockTextStream = {
-        [Symbol.asyncIterator]() {
-          return {
-            async next() {
-              if (chunkIndex < textChunks.length) {
-                return { done: false, value: textChunks[chunkIndex++] };
-              }
-              return { done: true, value: undefined };
-            },
-            async return(val?: any) {
-              return { done: true as const, value: val };
-            },
-          };
-        },
-      };
+      await exporter.exportTracingEvent(makeEvent(makeSpan({
+        type: 'agent_run',
+        input: [{ role: 'user', content: 'Run this' }],
+        output: { result: 'done' },
+      })));
 
-      const mockAgentInstance = { name: 'EarlyExitAgent' };
-      const originalStream = vi.fn().mockResolvedValue({ textStream: mockTextStream });
-      const mockAgent = {
-        prototype: {
-          stream: originalStream,
-          generate: vi.fn(),
-        },
-      };
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+        'input.value',
+        expect.stringContaining('Run this'),
+      );
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+        'output.value',
+        expect.stringContaining('done'),
+      );
+    });
 
-      const moduleExports = { Agent: mockAgent };
-      (instrumentation as any)._patch(moduleExports);
+    it('should set session.id from conversationId on agent_run spans', async () => {
+      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
+      const instance = new (mockModule.Mastra as any)({});
+      const exporter = instance.config.observability.configs.default.exporters[0];
 
-      const result = await mockAgent.prototype.stream.call(mockAgentInstance, 'Hi');
+      await exporter.exportTracingEvent(makeEvent(makeSpan({
+        type: 'agent_run',
+        attributes: { conversationId: 'conv-123' },
+      })));
 
-      // Get the iterator and call return() without consuming any items
-      // (mirrors what for-await does on an early break/return)
-      const iter = result.textStream[Symbol.asyncIterator]();
-      await iter.return?.();
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('session.id', 'conv-123');
+    });
 
-      const spans = exporter.getFinishedSpans();
-      expect(spans.length).toBe(1);
-      expect(spans[0].name).toBe('mastra.agent.stream');
-      expect(spans[0].status.code).toBe(SpanStatusCode.OK);
-      // Output.value should be set (even with empty accumulated text)
-      expect(spans[0].attributes['openinference.span.kind']).toBe('AGENT');
+    it('should set tool.name for tool_call spans', async () => {
+      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
+      const instance = new (mockModule.Mastra as any)({});
+      const exporter = instance.config.observability.configs.default.exporters[0];
+
+      await exporter.exportTracingEvent(makeEvent(makeSpan({
+        type: 'tool_call',
+        name: 'get_weather',
+        attributes: { toolDescription: 'Gets weather data' },
+      })));
+
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('tool.name', 'get_weather');
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('tool.description', 'Gets weather data');
+    });
+
+    it('should record error info on failed spans', async () => {
+      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
+      const instance = new (mockModule.Mastra as any)({});
+      const exporter = instance.config.observability.configs.default.exporters[0];
+
+      await exporter.exportTracingEvent(makeEvent(makeSpan({
+        type: 'agent_run',
+        errorInfo: { message: 'Agent crashed', name: 'Error' },
+      })));
+
+      expect(mockSpan.setStatus).toHaveBeenCalledWith({
+        code: SpanStatusCode.ERROR,
+        message: 'Agent crashed',
+      });
+      expect(mockSpan.recordException).toHaveBeenCalled();
+    });
+
+    it('should set OK status on successful spans', async () => {
+      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
+      const instance = new (mockModule.Mastra as any)({});
+      const exporter = instance.config.observability.configs.default.exporters[0];
+
+      await exporter.exportTracingEvent(makeEvent(makeSpan({ type: 'agent_run' })));
+
+      expect(mockSpan.setStatus).toHaveBeenCalledWith({ code: SpanStatusCode.OK });
+    });
+
+    it('should end the OTel span with the Mastra span endTime', async () => {
+      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
+      const instance = new (mockModule.Mastra as any)({});
+      const exporter = instance.config.observability.configs.default.exporters[0];
+
+      const endTime = new Date('2024-06-01T12:00:05Z');
+      await exporter.exportTracingEvent(makeEvent(makeSpan({ endTime })));
+
+      expect(mockSpan.end).toHaveBeenCalledWith(endTime.getTime());
+    });
+
+    it('should set metadata as JSON attribute when present', async () => {
+      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
+      const instance = new (mockModule.Mastra as any)({});
+      const exporter = instance.config.observability.configs.default.exporters[0];
+
+      await exporter.exportTracingEvent(makeEvent(makeSpan({
+        metadata: { userId: 'u-1', env: 'prod' },
+      })));
+
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith(
+        'metadata',
+        JSON.stringify({ userId: 'u-1', env: 'prod' }),
+      );
+    });
+
+    it('should set tag.tags when tags are present', async () => {
+      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
+      const instance = new (mockModule.Mastra as any)({});
+      const exporter = instance.config.observability.configs.default.exporters[0];
+
+      await exporter.exportTracingEvent(makeEvent(makeSpan({
+        tags: ['production', 'v2'],
+        isRootSpan: true,
+      })));
+
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('tag.tags', ['production', 'v2']);
     });
   });
 
-  describe('Workflow.execute patch behavior', () => {
-    let provider: NodeTracerProvider;
-    let exporter: InMemorySpanExporter;
+  // -------------------------------------------------------------------------
+  // disable()
+  // -------------------------------------------------------------------------
 
-    beforeEach(() => {
-      exporter = new InMemorySpanExporter();
-      provider = new NodeTracerProvider();
-      provider.addSpanProcessor(new SimpleSpanProcessor(exporter));
-      provider.register();
-      instrumentation.setTracerProvider(provider);
+  describe('disable()', () => {
+    it('should not throw when called before instrument()', () => {
+      expect(() => instrumentor.disable()).not.toThrow();
     });
 
-    afterEach(async () => {
-      exporter.reset();
-      await provider.shutdown();
-    });
-
-    it('should wrap workflow.execute and set attributes', async () => {
-      const executeResult = { status: 'completed', output: { data: 42 } };
-
-      const mockWorkflowInstance = {
-        name: 'DataPipeline',
-      };
-
-      const originalExecute = vi.fn().mockResolvedValue(executeResult);
-      const mockWorkflow = {
-        prototype: {
-          execute: originalExecute,
-        },
-      };
-
-      const moduleExports = { Workflow: mockWorkflow };
-      (instrumentation as any)._patch(moduleExports);
-
-      const result = await mockWorkflow.prototype.execute.call(
-        mockWorkflowInstance,
-        { input: 'test-data' },
-      );
-
-      expect(result).toEqual(executeResult);
-
-      const spans = exporter.getFinishedSpans();
-      expect(spans.length).toBe(1);
-      expect(spans[0].name).toBe('mastra.workflow.execute');
-      expect(spans[0].attributes['openinference.span.kind']).toBe('WORKFLOW');
-      expect(spans[0].attributes['workflow.name']).toBe('DataPipeline');
-      expect(spans[0].attributes['input.value']).toBe('{"input":"test-data"}');
-      expect(spans[0].attributes['output.value']).toBe(
-        JSON.stringify(executeResult)
-      );
-    });
-  });
-
-  describe('createTool patch behavior', () => {
-    let provider: NodeTracerProvider;
-    let exporter: InMemorySpanExporter;
-
-    beforeEach(() => {
-      exporter = new InMemorySpanExporter();
-      provider = new NodeTracerProvider();
-      provider.addSpanProcessor(new SimpleSpanProcessor(exporter));
-      provider.register();
-      instrumentation.setTracerProvider(provider);
-    });
-
-    afterEach(async () => {
-      exporter.reset();
-      await provider.shutdown();
-    });
-
-    it('should wrap tool.execute returned by createTool', async () => {
-      const toolResult = { answer: 42 };
-      const originalToolExecute = vi.fn().mockResolvedValue(toolResult);
-
-      const originalCreateTool = vi.fn().mockReturnValue({
-        id: 'calculator',
-        name: 'Calculator',
-        description: 'Performs calculations',
-        execute: originalToolExecute,
-      });
-
-      const moduleExports = { createTool: originalCreateTool };
-      (instrumentation as any)._patch(moduleExports);
-
-      // Call createTool (patched)
-      const tool = moduleExports.createTool({ id: 'calculator' });
-
-      // Call the patched execute
-      const result = await tool.execute({ expression: '2+2' });
-
-      expect(result).toEqual(toolResult);
-
-      const spans = exporter.getFinishedSpans();
-      expect(spans.length).toBe(1);
-      expect(spans[0].name).toBe('mastra.tool.execute');
-      expect(spans[0].attributes['openinference.span.kind']).toBe('TOOL');
-      expect(spans[0].attributes['tool.name']).toBe('calculator');
-      expect(spans[0].attributes['tool.description']).toBe('Performs calculations');
-      expect(spans[0].attributes['input.value']).toBe('{"expression":"2+2"}');
-      expect(spans[0].attributes['output.value']).toBe('{"answer":42}');
-    });
-
-    it('should handle createTool returning tool without execute', () => {
-      const originalCreateTool = vi.fn().mockReturnValue({
-        id: 'no-exec-tool',
-      });
-
-      const moduleExports = { createTool: originalCreateTool };
-      expect(() => (instrumentation as any)._patch(moduleExports)).not.toThrow();
-
-      const tool = moduleExports.createTool({});
-      expect(tool.id).toBe('no-exec-tool');
+    it('should allow re-instrumentation after disable', () => {
+      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
+      instrumentor.disable();
+      expect(() =>
+        instrumentor.instrument({ tracerProvider: provider, _module: mockModule }),
+      ).not.toThrow();
     });
   });
 });
