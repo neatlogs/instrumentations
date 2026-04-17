@@ -1,7 +1,7 @@
 {
   "name": "@neatlogs/instrumentation-mastra",
   "version": "0.1.0",
-  "description": "OpenTelemetry instrumentation for Mastra AI framework (@mastra/core)",
+  "description": "Neatlogs instrumentation for Mastra AI framework (@mastra/core)",
   "main": "./dist/cjs/index.js",
   "module": "./dist/esm/index.js",
   "types": "./dist/esm/index.d.ts",
@@ -30,14 +30,17 @@
   "keywords": ["opentelemetry", "instrumentation", "mastra", "ai", "agent", "neatlogs", "tracing"],
   "license": "MIT",
   "dependencies": {
-    "@opentelemetry/api": "^1.9.0",
-    "@opentelemetry/instrumentation": "^0.57.0"
+    "@opentelemetry/api": "^1.9.0"
   },
   "peerDependencies": {
-    "@mastra/core": ">=1.0.0"
+    "@mastra/core": ">=1.0.0",
+    "@mastra/observability": ">=1.0.0"
   },
   "peerDependenciesMeta": {
     "@mastra/core": {
+      "optional": true
+    },
+    "@mastra/observability": {
       "optional": true
     }
   },
