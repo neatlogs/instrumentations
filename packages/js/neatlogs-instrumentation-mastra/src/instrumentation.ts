@@ -1,432 +1,529 @@
+/**
+ * Neatlogs instrumentation for @mastra/core.
+ *
+ * Patches the Mastra constructor to auto-inject a NeatlogsMastraExporter
+ * into Mastra's observability config. The exporter implements BaseExporter
+ * and receives AnyExportedSpan objects from Mastra's internal observability,
+ * converting them to OpenInference-format OTel spans.
+ *
+ * Usage (via neatlogs SDK):
+ *   neatlogs.init({ instrumentations: ['mastra'] })
+ *
+ * Usage (standalone):
+ *   import MastraInstrumentor from '@neatlogs/instrumentation-mastra';
+ *   const instr = new MastraInstrumentor();
+ *   instr.instrument({ tracerProvider: myProvider });
+ */
+
 import {
-  InstrumentationBase,
-  InstrumentationNodeModuleDefinition,
-} from '@opentelemetry/instrumentation';
-import {
-  trace,
+  type Tracer,
+  type TracerProvider,
   SpanKind,
   SpanStatusCode,
-  type Span,
+  context,
+  trace,
 } from '@opentelemetry/api';
-import type { MastraInstrumentationConfig } from './types.js';
-import {
-  setAgentAttributes,
-  setAgentResponseAttributes,
-  setWorkflowAttributes,
-  setToolAttributes,
-  safeJsonStringify,
-} from './attributes.js';
 
-const INSTRUMENTATION_NAME = '@neatlogs/instrumentation-mastra';
-const INSTRUMENTATION_VERSION = '0.1.0';
+// ---------------------------------------------------------------------------
+// SpanType → OpenInference span kind mapping
+// ---------------------------------------------------------------------------
 
-export class MastraInstrumentation extends InstrumentationBase<MastraInstrumentationConfig> {
-  private _agentPrototype: any = null;
-  private _workflowPrototype: any = null;
-  /** The module-exports object on which createTool was wrapped, for correct unpatch. */
-  private _patchedToolsModule: any = null;
+const SPAN_TYPE_TO_OI_KIND: Record<string, string> = {
+  // LLM spans
+  model_generation: 'LLM',
+  model_step: 'LLM',
+  model_chunk: 'LLM',
+  // Tool spans
+  tool_call: 'TOOL',
+  mcp_tool_call: 'TOOL',
+  // Agent spans
+  agent_run: 'AGENT',
+  scorer_run: 'AGENT',
+  // Workflow spans
+  workflow_run: 'WORKFLOW',
+  workflow_step: 'CHAIN',
+  workflow_conditional: 'CHAIN',
+  workflow_conditional_eval: 'CHAIN',
+  workflow_parallel: 'CHAIN',
+  workflow_loop: 'CHAIN',
+  workflow_sleep: 'CHAIN',
+  workflow_wait_event: 'CHAIN',
+  // RAG spans
+  rag_ingestion: 'RETRIEVER',
+  rag_embedding: 'EMBEDDING',
+  rag_vector_operation: 'RETRIEVER',
+  rag_action: 'RETRIEVER',
+  // Memory
+  memory_operation: 'CHAIN',
+  // Everything else
+  generic: 'CHAIN',
+  processor_run: 'CHAIN',
+  workspace_action: 'CHAIN',
+  graph_action: 'CHAIN',
+  scorer_step: 'CHAIN',
+};
 
-  constructor(config: MastraInstrumentationConfig = {}) {
-    super(INSTRUMENTATION_NAME, INSTRUMENTATION_VERSION, config);
-  }
+function getOiKind(spanType: string): string {
+  return SPAN_TYPE_TO_OI_KIND[spanType] ?? 'CHAIN';
+}
 
-  /**
-   * Context-aware span helper: if Mastra's OtelBridge already created an
-   * active span, enrich it with OpenInference attributes. Otherwise, create
-   * our own span.
-   */
-  private async _getOrCreateSpan<T>(
-    spanName: string,
-    fn: (span: Span, isOwnSpan: boolean) => Promise<T>,
-    /** When false, the caller is responsible for ending the span (e.g., streaming). */
-    manageLifecycle = true,
-  ): Promise<T> {
-    const activeSpan = trace.getActiveSpan();
-    if (activeSpan && activeSpan.isRecording()) {
-      // Mastra's OtelBridge already created a span — enrich it (don't end it)
-      return fn(activeSpan, false);
+// ---------------------------------------------------------------------------
+// Message conversion helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Flatten a Mastra message array (from span.input or span.output on LLM spans)
+ * into flat indexed OTel attributes:
+ *   llm.input_messages.0.message.role
+ *   llm.input_messages.0.message.content
+ *   llm.input_messages.0.message.tool_calls.0.tool_call.function.name
+ *   llm.input_messages.0.message.tool_calls.0.tool_call.function.arguments
+ */
+function flattenMessages(
+  messages: any[],
+  prefix: string,
+  setAttr: (key: string, value: string | number) => void,
+): void {
+  if (!Array.isArray(messages)) return;
+  messages.forEach((msg: any, i: number) => {
+    if (!msg || typeof msg !== 'object') return;
+    const role = msg.role ?? 'user';
+    setAttr(`${prefix}.${i}.message.role`, String(role));
+
+    // Content: string or array of content parts
+    if (typeof msg.content === 'string') {
+      setAttr(`${prefix}.${i}.message.content`, msg.content);
+    } else if (Array.isArray(msg.content)) {
+      const textParts = msg.content
+        .filter((p: any) => p?.type === 'text' && p?.text)
+        .map((p: any) => p.text)
+        .join('');
+      if (textParts) {
+        setAttr(`${prefix}.${i}.message.content`, textParts);
+      }
     }
-    // No active span — create our own
-    return this.tracer.startActiveSpan(
-      spanName,
-      { kind: SpanKind.INTERNAL },
-      async (span: Span) => {
-        try {
-          const result = await fn(span, true);
-          if (manageLifecycle) {
-            span.setStatus({ code: SpanStatusCode.OK });
-            span.end();
-          }
-          return result;
-        } catch (error: any) {
-          span.setStatus({ code: SpanStatusCode.ERROR, message: error?.message });
-          span.recordException(error);
-          span.end();
-          throw error;
+
+    // Tool calls (on assistant messages)
+    if (Array.isArray(msg.toolCalls) || Array.isArray(msg.tool_calls)) {
+      const toolCalls = msg.toolCalls ?? msg.tool_calls;
+      toolCalls.forEach((tc: any, j: number) => {
+        const name = tc?.toolName ?? tc?.function?.name ?? tc?.name ?? '';
+        const args = tc?.args ?? tc?.function?.arguments ?? tc?.arguments;
+        if (name) {
+          setAttr(
+            `${prefix}.${i}.message.tool_calls.${j}.tool_call.function.name`,
+            String(name),
+          );
         }
-      },
-    );
-  }
-
-  /**
-   * Set input.value on a span from the first argument if present.
-   */
-  private _setInputValue(span: Span, args: any[]): void {
-    if (args.length > 0) {
-      const inputValue = safeJsonStringify(args[0]);
-      if (inputValue) {
-        span.setAttribute('input.value', inputValue);
-      }
-    }
-  }
-
-  protected init() {
-    return new InstrumentationNodeModuleDefinition(
-      '@mastra/core',
-      ['>=1.0.0'],
-      (moduleExports: any) => {
-        this._patch(moduleExports);
-        return moduleExports;
-      },
-      (moduleExports: any) => {
-        this._unpatch(moduleExports);
-      },
-    );
-  }
-
-  /**
-   * Patch Agent, Workflow, and createTool.
-   *
-   * Older versions of @mastra/core export everything from the root entry
-   * point, so we first try patching from `moduleExports` directly.
-   *
-   * Newer versions (v1.25+) moved these to subpath exports
-   * (@mastra/core/agent, @mastra/core/workflows, @mastra/core/tools).
-   * The OTel require-in-the-middle hook resolves subpath imports to
-   * internal file paths (e.g. @mastra/core/dist/agent/index.cjs) which
-   * cannot be reliably matched by InstrumentationNodeModuleFile names.
-   * Instead, we dynamically require the subpath modules here. Since the
-   * root @mastra/core package is already resolved at this point, Node
-   * will resolve the subpaths from the same package directory.
-   *
-   * **Limitations:**
-   * - This dynamic `require()` approach only works in CJS contexts. In
-   *   ESM applications, the OTel `import-in-the-middle` hook uses
-   *   `internals: false`, so subpath ESM imports won't trigger the root
-   *   module's patch callback. The root `@mastra/core` ESM import will
-   *   trigger it, but the dynamic `require()` may load the CJS version
-   *   instead of the ESM version. Full ESM support for subpath modules
-   *   would require a different hooking strategy.
-   * - If user code only requires subpath modules and never imports the
-   *   root `@mastra/core`, the patch callback won't fire. In practice
-   *   this is unlikely because Mastra apps always import the `Mastra`
-   *   class from the root entry point.
-   */
-  private _patch(moduleExports: any): void {
-    // Try patching from root exports (works for older versions)
-    this._patchAgentModule(moduleExports);
-    this._patchWorkflowModule(moduleExports);
-    this._patchToolsModule(moduleExports);
-
-    // For newer versions where classes live in subpath exports,
-    // dynamically require and patch each subpath module.
-    if (!moduleExports?.Agent) {
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        this._patchAgentModule(require('@mastra/core/agent'));
-      } catch {
-        // Subpath not available — skip
-      }
-    }
-    if (!moduleExports?.Workflow) {
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        this._patchWorkflowModule(require('@mastra/core/workflows'));
-      } catch {
-        // Subpath not available — skip
-      }
-    }
-    if (!moduleExports?.createTool) {
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        this._patchToolsModule(require('@mastra/core/tools'));
-      } catch {
-        // Subpath not available — skip
-      }
-    }
-  }
-
-  private _unpatch(moduleExports: any): void {
-    this._unpatchAgentModule(moduleExports);
-    this._unpatchWorkflowModule(moduleExports);
-    this._unpatchToolsModule(moduleExports);
-  }
-
-  /**
-   * Patch Agent.prototype.generate and Agent.prototype.stream.
-   * Works for both root module exports and @mastra/core/agent subpath.
-   */
-  private _patchAgentModule(moduleExports: any): void {
-    const Agent = moduleExports?.Agent;
-    if (Agent?.prototype) {
-      this._agentPrototype = Agent.prototype;
-
-      if (typeof Agent.prototype.generate === 'function') {
-        this._wrap(Agent.prototype, 'generate', this._patchAgentGenerate());
-      }
-
-      if (typeof Agent.prototype.stream === 'function') {
-        this._wrap(Agent.prototype, 'stream', this._patchAgentStream());
-      }
-    }
-  }
-
-  private _unpatchAgentModule(_moduleExports?: any): void {
-    if (this._agentPrototype) {
-      if (typeof this._agentPrototype.generate === 'function') {
-        this._unwrap(this._agentPrototype, 'generate');
-      }
-      if (typeof this._agentPrototype.stream === 'function') {
-        this._unwrap(this._agentPrototype, 'stream');
-      }
-      this._agentPrototype = null;
-    }
-  }
-
-  /**
-   * Patch Workflow.prototype.execute.
-   * Works for both root module exports and @mastra/core/workflows subpath.
-   */
-  private _patchWorkflowModule(moduleExports: any): void {
-    const Workflow = moduleExports?.Workflow;
-    if (Workflow?.prototype) {
-      this._workflowPrototype = Workflow.prototype;
-
-      if (typeof Workflow.prototype.execute === 'function') {
-        this._wrap(Workflow.prototype, 'execute', this._patchWorkflowExecute());
-      }
-    }
-  }
-
-  private _unpatchWorkflowModule(_moduleExports?: any): void {
-    if (this._workflowPrototype) {
-      if (typeof this._workflowPrototype.execute === 'function') {
-        this._unwrap(this._workflowPrototype, 'execute');
-      }
-      this._workflowPrototype = null;
-    }
-  }
-
-  /**
-   * Patch createTool function.
-   * Works for both root module exports and @mastra/core/tools subpath.
-   */
-  private _patchToolsModule(moduleExports: any): void {
-    if (typeof moduleExports?.createTool === 'function') {
-      // Store the module reference (not the original fn) so _unpatchToolsModule always
-      // unwraps from the exact object that was wrapped — avoids mismatched-object bugs
-      // when root and subpath exports are different objects.
-      this._patchedToolsModule = moduleExports;
-      this._wrap(moduleExports, 'createTool', this._patchCreateToolFn());
-    }
-  }
-
-  private _unpatchToolsModule(_moduleExports?: any): void {
-    if (this._patchedToolsModule) {
-      this._unwrap(this._patchedToolsModule, 'createTool');
-      this._patchedToolsModule = null;
-    }
-  }
-
-  private _patchAgentGenerate() {
-    const instrumentation = this;
-    return function generatePatchFactory(original: Function) {
-      return function patchedGenerate(this: any, ...args: any[]) {
-        const agent = this;
-        return instrumentation._getOrCreateSpan(
-          'mastra.agent.generate',
-          async (span: Span) => {
-            setAgentAttributes(span, agent);
-            instrumentation._setInputValue(span, args);
-
-            const result = await original.apply(agent, args);
-            setAgentResponseAttributes(span, result);
-            return result;
-          },
-        );
-      };
-    };
-  }
-
-  private _patchAgentStream() {
-    const instrumentation = this;
-    return function streamPatchFactory(original: Function) {
-      return function patchedStream(this: any, ...args: any[]) {
-        const agent = this;
-        // Pass manageLifecycle=false so the span stays open until the stream is consumed
-        return instrumentation._getOrCreateSpan(
-          'mastra.agent.stream',
-          async (span: Span, isOwnSpan: boolean) => {
-            setAgentAttributes(span, agent);
-            instrumentation._setInputValue(span, args);
-
-            const result = await original.apply(agent, args);
-
-            // Wrap the textStream to accumulate output and set attributes on completion.
-            // Mastra exposes textStream as an AsyncIterable property, not a method.
-            if (result && result.textStream) {
-              const originalTextStream = result.textStream;
-              const chunks: string[] = [];
-              let finalized = false;
-
-              const finalizeStream = async () => {
-                if (finalized) return;
-                finalized = true;
-
-                const accumulatedText = chunks.join('');
-                const responseData: any = { text: accumulatedText };
-
-                try {
-                  if (result.usage && typeof result.usage.then === 'function') {
-                    const usage = await result.usage;
-                    responseData.usage = usage;
-                  } else if (result.usage) {
-                    responseData.usage = result.usage;
-                  }
-                } catch {
-                  // ignore usage errors
-                }
-
-                setAgentResponseAttributes(span, responseData);
-                // Only end the span if we created it (not borrowed from OtelBridge)
-                if (isOwnSpan) {
-                  span.setStatus({ code: SpanStatusCode.OK });
-                  span.end();
-                }
-              };
-
-              const wrappedTextStream = {
-                [Symbol.asyncIterator]() {
-                  let iterator: any;
-                  if (typeof originalTextStream[Symbol.asyncIterator] === 'function') {
-                    iterator = originalTextStream[Symbol.asyncIterator]();
-                  } else if (typeof originalTextStream.next === 'function') {
-                    iterator = originalTextStream;
-                  } else {
-                    setAgentResponseAttributes(span, { text: '' });
-                    if (isOwnSpan) {
-                      span.setStatus({ code: SpanStatusCode.OK });
-                      span.end();
-                    }
-                    finalized = true;
-                    return {
-                      async next() { return { done: true as const, value: undefined }; },
-                    };
-                  }
-                  return {
-                    async next() {
-                      try {
-                        const iterResult = await iterator.next();
-                        if (!iterResult.done && iterResult.value != null) {
-                          chunks.push(
-                            typeof iterResult.value === 'string'
-                              ? iterResult.value
-                              : String(iterResult.value),
-                          );
-                        }
-                        if (iterResult.done) {
-                          await finalizeStream();
-                        }
-                        return iterResult;
-                      } catch (error: any) {
-                        if (!finalized && isOwnSpan) {
-                          finalized = true;
-                          span.setStatus({ code: SpanStatusCode.ERROR, message: error?.message });
-                          span.recordException(error);
-                          span.end();
-                        }
-                        throw error;
-                      }
-                    },
-                    async return(value?: any) {
-                      await finalizeStream();
-                      return iterator.return?.(value) ?? { done: true as const, value };
-                    },
-                  };
-                },
-              };
-
-              return { ...result, textStream: wrappedTextStream };
-            }
-
-            // No textStream — end span normally
-            if (isOwnSpan) {
-              span.setStatus({ code: SpanStatusCode.OK });
-              span.end();
-            }
-            return result;
-          },
-          false, // Don't auto-end span — stream wrapper or fallback handles it
-        );
-      };
-    };
-  }
-
-  private _patchWorkflowExecute() {
-    const instrumentation = this;
-    return function executePatchFactory(original: Function) {
-      return function patchedExecute(this: any, ...args: any[]) {
-        const workflow = this;
-        return instrumentation._getOrCreateSpan(
-          'mastra.workflow.execute',
-          async (span: Span) => {
-            setWorkflowAttributes(span, workflow);
-            instrumentation._setInputValue(span, args);
-
-            const result = await original.apply(workflow, args);
-
-            const outputValue = safeJsonStringify(result);
-            if (outputValue) {
-              span.setAttribute('output.value', outputValue);
-            }
-
-            return result;
-          },
-        );
-      };
-    };
-  }
-
-  private _patchCreateToolFn() {
-    const instrumentation = this;
-    return function createToolPatchFactory(original: Function) {
-      return function patchedCreateTool(this: any, ...args: any[]) {
-        const tool = original.apply(this, args);
-
-        if (tool && typeof tool.execute === 'function') {
-          const originalExecute = tool.execute;
-          tool.execute = function patchedToolExecute(this: any, ...executeArgs: any[]) {
-            const input = executeArgs[0];
-            return instrumentation._getOrCreateSpan(
-              'mastra.tool.execute',
-              async (span: Span) => {
-                setToolAttributes(span, tool, input);
-
-                const result = await originalExecute.apply(this, executeArgs);
-
-                const outputValue = safeJsonStringify(result);
-                if (outputValue) {
-                  span.setAttribute('output.value', outputValue);
-                }
-
-                return result;
-              },
-            );
-          };
+        if (args !== undefined) {
+          setAttr(
+            `${prefix}.${i}.message.tool_calls.${j}.tool_call.function.arguments`,
+            typeof args === 'string' ? args : JSON.stringify(args),
+          );
         }
+      });
+    }
 
-        return tool;
-      };
-    };
+    // Tool result (on tool messages)
+    if (role === 'tool' && msg.toolCallId) {
+      setAttr(`${prefix}.${i}.tool_call_id`, String(msg.toolCallId));
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function _safeStringify(value: any, maxLen = 100_000): string {
+  if (typeof value === 'string') return value.slice(0, maxLen);
+  try {
+    return JSON.stringify(value).slice(0, maxLen);
+  } catch {
+    return String(value).slice(0, maxLen);
   }
 }
+
+// ---------------------------------------------------------------------------
+// NeatlogsMastraExporter
+// ---------------------------------------------------------------------------
+
+/**
+ * Implements Mastra's BaseExporter interface (duck-typed — no import needed).
+ * Receives AnyExportedSpan from Mastra's internal observability,
+ * converts to OpenInference OTel attributes, and creates OTel spans
+ * on the provided TracerProvider.
+ */
+export class NeatlogsMastraExporter {
+  name = 'neatlogs';
+  private _tracer: Tracer;
+  // Track active OTel spans by Mastra span ID so child spans can be parented correctly
+  private _activeSpans: Map<string, any> = new Map();
+
+  constructor(tracerProvider: TracerProvider) {
+    this._tracer = tracerProvider.getTracer('openinference.instrumentation.mastra');
+  }
+
+  // BaseExporter interface methods
+  async exportTracingEvent(event: any): Promise<void> {
+    return this._exportTracingEvent(event);
+  }
+
+  onTracingEvent(event: any): void | Promise<void> {
+    return this.exportTracingEvent(event);
+  }
+
+  async _exportTracingEvent(event: any): Promise<void> {
+    // Only process completed spans
+    if (event.type !== 'span_ended') return;
+    const span = event.exportedSpan;
+    if (!span) return;
+
+    try {
+      this._processSpan(span);
+    } catch (err) {
+      // best-effort — never let exporter errors surface to user code
+    }
+  }
+
+  private _processSpan(span: any): void {
+    const oiKind = getOiKind(span.type ?? 'generic');
+    const spanName = span.name ?? span.type ?? 'mastra.span';
+
+    // Determine parent context: use parent OTel span if we tracked one
+    const parentOtelSpan = span.parentSpanId
+      ? this._activeSpans.get(span.parentSpanId)
+      : undefined;
+    const parentCtx = parentOtelSpan
+      ? trace.setSpan(context.active(), parentOtelSpan)
+      : context.active();
+
+    const otelSpan = this._tracer.startSpan(
+      spanName,
+      {
+        kind: SpanKind.INTERNAL,
+        startTime: span.startTime ? new Date(span.startTime).getTime() : undefined,
+      },
+      parentCtx,
+    );
+
+    // Core OpenInference attributes
+    otelSpan.setAttribute('openinference.span.kind', oiKind);
+
+    // Entity info
+    if (span.entityName) {
+      otelSpan.setAttribute('mastra.entity.name', span.entityName);
+    }
+    if (span.entityType) {
+      otelSpan.setAttribute('mastra.entity.type', span.entityType);
+    }
+
+    // Span-type-specific attributes
+    this._setTypeAttributes(otelSpan, span);
+
+    // Input / output
+    this._setInputOutput(otelSpan, span);
+
+    // Error handling
+    if (span.errorInfo) {
+      otelSpan.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: span.errorInfo.message,
+      });
+      otelSpan.recordException(new Error(span.errorInfo.message));
+    } else {
+      otelSpan.setStatus({ code: SpanStatusCode.OK });
+    }
+
+    // Metadata as JSON
+    if (span.metadata && Object.keys(span.metadata).length > 0) {
+      try {
+        otelSpan.setAttribute('metadata', JSON.stringify(span.metadata));
+      } catch {
+        // best-effort
+      }
+    }
+
+    // Tags (root spans only)
+    if (Array.isArray(span.tags) && span.tags.length > 0) {
+      otelSpan.setAttribute('tag.tags', span.tags);
+    }
+
+    otelSpan.end(span.endTime ? new Date(span.endTime).getTime() : undefined);
+
+    // Clean up tracking
+    this._activeSpans.delete(span.id);
+  }
+
+  private _setTypeAttributes(otelSpan: any, span: any): void {
+    const attrs = span.attributes ?? {};
+    const type = span.type ?? '';
+
+    if (type === 'model_generation' || type === 'model_step') {
+      // Model name
+      if (attrs.model) {
+        otelSpan.setAttribute('llm.model_name', attrs.model);
+        otelSpan.setAttribute('gen_ai.request.model', attrs.model);
+      }
+      if (attrs.responseModel) {
+        otelSpan.setAttribute('gen_ai.response.model', attrs.responseModel);
+      }
+      // Provider
+      if (attrs.provider) {
+        otelSpan.setAttribute('gen_ai.system', attrs.provider);
+        otelSpan.setAttribute('llm.provider', attrs.provider);
+      }
+      // Finish reason
+      if (attrs.finishReason) {
+        otelSpan.setAttribute('llm.response.finish_reason', attrs.finishReason);
+      }
+      // Token usage
+      const usage = attrs.usage;
+      if (usage) {
+        if (usage.inputTokens !== undefined) {
+          otelSpan.setAttribute('llm.token_count.prompt', usage.inputTokens);
+        }
+        if (usage.outputTokens !== undefined) {
+          otelSpan.setAttribute('llm.token_count.completion', usage.outputTokens);
+        }
+        if (usage.inputTokens !== undefined && usage.outputTokens !== undefined) {
+          otelSpan.setAttribute('llm.token_count.total', usage.inputTokens + usage.outputTokens);
+        }
+        const inputDetails = usage.inputDetails;
+        if (inputDetails) {
+          if (inputDetails.cacheRead !== undefined) {
+            otelSpan.setAttribute('llm.token_count.prompt_details.cache_read', inputDetails.cacheRead);
+          }
+          if (inputDetails.cacheWrite !== undefined) {
+            otelSpan.setAttribute('llm.token_count.prompt_details.cache_write', inputDetails.cacheWrite);
+          }
+          if (inputDetails.audio !== undefined) {
+            otelSpan.setAttribute('llm.token_count.prompt_details.audio', inputDetails.audio);
+          }
+        }
+        const outputDetails = usage.outputDetails;
+        if (outputDetails) {
+          if (outputDetails.reasoning !== undefined) {
+            otelSpan.setAttribute('llm.token_count.completion_details.reasoning', outputDetails.reasoning);
+          }
+          if (outputDetails.audio !== undefined) {
+            otelSpan.setAttribute('llm.token_count.completion_details.audio', outputDetails.audio);
+          }
+        }
+      }
+      // Model parameters
+      if (attrs.parameters) {
+        try {
+          otelSpan.setAttribute('llm.invocation_parameters', JSON.stringify(attrs.parameters));
+        } catch {
+          // best-effort
+        }
+      }
+      // TTFT (time to first token)
+      if (attrs.completionStartTime && span.startTime) {
+        const completionStart = new Date(attrs.completionStartTime).getTime();
+        const ttft = completionStart - new Date(span.startTime).getTime();
+        if (ttft >= 0) {
+          otelSpan.setAttribute('mastra.completion_start_time', new Date(attrs.completionStartTime).toISOString());
+          otelSpan.setAttribute('llm.time_to_first_token', ttft);
+        }
+      }
+    }
+
+    if (type === 'agent_run') {
+      if (attrs.conversationId) {
+        otelSpan.setAttribute('session.id', attrs.conversationId);
+      }
+      if (attrs.instructions) {
+        otelSpan.setAttribute('llm.system', attrs.instructions);
+      }
+      if (Array.isArray(attrs.availableTools) && attrs.availableTools.length > 0) {
+        otelSpan.setAttribute('mastra.agent.available_tools', attrs.availableTools.join(','));
+      }
+    }
+
+    if (type === 'tool_call' || type === 'mcp_tool_call') {
+      if (span.name) {
+        otelSpan.setAttribute('tool.name', span.name);
+      }
+      if (attrs.toolDescription) {
+        otelSpan.setAttribute('tool.description', attrs.toolDescription);
+      }
+      if (type === 'mcp_tool_call' && attrs.mcpServer) {
+        otelSpan.setAttribute('mastra.mcp.server', attrs.mcpServer);
+      }
+    }
+
+    if (type === 'rag_embedding') {
+      if (attrs.model) {
+        otelSpan.setAttribute('embedding.model_name', attrs.model);
+      }
+      if (attrs.provider) {
+        otelSpan.setAttribute('gen_ai.system', attrs.provider);
+      }
+      const usage = attrs.usage;
+      if (usage?.inputTokens !== undefined) {
+        otelSpan.setAttribute('llm.token_count.prompt', usage.inputTokens);
+      }
+    }
+  }
+
+  private _setInputOutput(otelSpan: any, span: any): void {
+    const type = span.type ?? '';
+    const isLlmSpan = type === 'model_generation' || type === 'model_step';
+
+    if (isLlmSpan) {
+      // Flatten message arrays to indexed attributes
+      if (Array.isArray(span.input) && span.input.length > 0) {
+        flattenMessages(span.input, 'llm.input_messages', (k, v) =>
+          otelSpan.setAttribute(k, v),
+        );
+      } else if (span.input !== undefined && span.input !== null) {
+        // Includes empty array [] — emit as JSON so the value is not silently dropped
+        otelSpan.setAttribute('input.value', _safeStringify(span.input));
+      }
+
+      if (Array.isArray(span.output) && span.output.length > 0) {
+        flattenMessages(span.output, 'llm.output_messages', (k, v) =>
+          otelSpan.setAttribute(k, v),
+        );
+      } else if (span.output !== undefined && span.output !== null) {
+        // Includes empty array [] — emit as JSON so the value is not silently dropped
+        otelSpan.setAttribute('output.value', _safeStringify(span.output));
+      }
+    } else {
+      // Non-LLM spans: use input.value / output.value
+      if (span.input !== undefined && span.input !== null) {
+        otelSpan.setAttribute('input.value', _safeStringify(span.input));
+      }
+      if (span.output !== undefined && span.output !== null) {
+        otelSpan.setAttribute('output.value', _safeStringify(span.output));
+      }
+    }
+  }
+
+  async flush(): Promise<void> {}
+  async shutdown(): Promise<void> {}
+  init?(_options: any): void {}
+}
+
+// ---------------------------------------------------------------------------
+// MastraInstrumentor
+// ---------------------------------------------------------------------------
+
+export interface MastraInstrumentorOptions {
+  tracerProvider: TracerProvider;
+  /** @internal — for testing only; inject the module instead of require(). */
+  _module?: any;
+  /** @internal — for testing only; inject a pre-built exporter instance. */
+  _exporter?: any;
+}
+
+/**
+ * Instrumentor for @mastra/core. Patches the Mastra constructor to
+ * auto-inject NeatlogsMastraExporter into Mastra's observability config.
+ *
+ * Compatible with the neatlogs SDK instrumentation manager interface:
+ *   instrumentor.instrument({ tracerProvider })
+ *   instrumentor.disable()
+ */
+export class MastraInstrumentor {
+  private _provider: TracerProvider | null = null;
+  private _origMastraConstructor: Function | null = null;
+  private _mastraModule: any = null;
+
+  instrument(options: MastraInstrumentorOptions): void {
+    this._provider = options.tracerProvider;
+
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const mastraModule = options._module ?? require('@mastra/core');
+      this._patchMastraConstructor(mastraModule, options);
+    } catch (e) {
+      // @mastra/core not installed — no-op
+    }
+  }
+
+  disable(): void {
+    if (this._mastraModule && this._origMastraConstructor) {
+      // Restore the original constructor on the module export.
+      // ES module exports may be read-only, so fall back to Object.defineProperty.
+      try {
+        this._mastraModule.Mastra = this._origMastraConstructor;
+      } catch {
+        try {
+          Object.defineProperty(this._mastraModule, 'Mastra', {
+            value: this._origMastraConstructor,
+            writable: true,
+            configurable: true,
+          });
+        } catch {
+          // best-effort — module exports may be non-configurable in some environments
+        }
+      }
+    }
+    this._origMastraConstructor = null;
+    this._mastraModule = null;
+    this._provider = null;
+  }
+
+  private _patchMastraConstructor(mastraModule: any, options: MastraInstrumentorOptions): void {
+    const MastraClass = mastraModule.Mastra;
+    if (!MastraClass) return;
+
+    const provider = this._provider!;
+    const origConstructor = MastraClass;
+    this._origMastraConstructor = origConstructor;
+    this._mastraModule = mastraModule;
+
+    // Replace the Mastra constructor with a wrapper that injects our exporter
+    const PatchedMastra = function (this: any, config?: any) {
+      const cfg = config ?? {};
+
+      // Only inject if user hasn't configured their own observability
+      if (!cfg.observability) {
+        const exporter = options._exporter ?? new NeatlogsMastraExporter(provider);
+        cfg.observability = {
+          configs: {
+            default: {
+              serviceName: 'mastra',
+              exporters: [exporter],
+            },
+          },
+        };
+      }
+
+      // Call the original constructor with the (possibly modified) config
+      return Reflect.construct(origConstructor, [cfg], new.target ?? origConstructor);
+    };
+
+    // Preserve prototype chain so instanceof checks still work
+    PatchedMastra.prototype = MastraClass.prototype;
+    Object.setPrototypeOf(PatchedMastra, MastraClass);
+
+    // Copy static properties
+    for (const key of Object.getOwnPropertyNames(MastraClass)) {
+      if (key === 'prototype' || key === 'length' || key === 'name') continue;
+      try {
+        const desc = Object.getOwnPropertyDescriptor(MastraClass, key);
+        if (desc) Object.defineProperty(PatchedMastra, key, desc);
+      } catch {
+        // best-effort
+      }
+    }
+
+    // Replace the Mastra constructor on the module with the wrapper.
+    // Use Object.defineProperty as a fallback for read-only ES module exports.
+    try {
+      mastraModule.Mastra = PatchedMastra;
+    } catch {
+      Object.defineProperty(mastraModule, 'Mastra', {
+        value: PatchedMastra,
+        writable: true,
+        configurable: true,
+      });
+    }
+  }
+}
+
+export default MastraInstrumentor;
