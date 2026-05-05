@@ -344,14 +344,24 @@ describe('MastraInstrumentor', () => {
       return { instance, exporter };
     }
 
-    it('should ignore non-span_ended events', async () => {
+    it('should ignore span_updated events', async () => {
       const { exporter } = setupExporter();
 
-      await exporter.exportTracingEvent({ type: 'span_started', exportedSpan: makeSpan() });
       await exporter.exportTracingEvent({ type: 'span_updated', exportedSpan: makeSpan() });
 
       const tracer = (provider.getTracer as any).mock.results[0]?.value;
       expect(tracer?.startSpan).not.toHaveBeenCalled();
+    });
+
+    it('should process span_started events (opens an OTel span)', async () => {
+      const { exporter } = setupExporter();
+
+      await exporter.exportTracingEvent({ type: 'span_started', exportedSpan: makeSpan() });
+
+      const tracer = (provider.getTracer as any).mock.results[0]?.value;
+      expect(tracer?.startSpan).toHaveBeenCalledTimes(1);
+      // span_started should NOT end the span — it stays active
+      expect(mockSpan.end).not.toHaveBeenCalled();
     });
 
     it('should create an OTel span for span_ended events', async () => {
@@ -382,6 +392,8 @@ describe('MastraInstrumentor', () => {
         ['generic', 'CHAIN'],
       ];
 
+      // NeatlogsMastraExporter is directly constructable — no need for a
+      // full instrumentor/module/Mastra-instance per test case.
       for (const [spanType, expectedKind] of cases) {
         const localSpan = createMockSpan();
         const localProvider: TracerProvider = {
@@ -390,20 +402,10 @@ describe('MastraInstrumentor', () => {
           })),
         } as any;
 
-        const localInstrumentor = new MastraInstrumentor();
-        const localModule = createMockMastraModule();
-        localInstrumentor.instrument({
-          tracerProvider: localProvider,
-          _module: localModule,
-          _observabilityModule: createMockObservabilityModule(),
-        });
-
-        const inst = new (localModule.Mastra as any)({});
-        const exp = inst.config.observability.getDefaultInstance().getExporters()[0];
-        await exp.exportTracingEvent(makeEvent(makeSpan({ type: spanType })));
+        const exporter = new NeatlogsMastraExporter(localProvider);
+        await exporter.exportTracingEvent(makeEvent(makeSpan({ type: spanType })));
 
         expect(localSpan.setAttribute).toHaveBeenCalledWith('openinference.span.kind', expectedKind);
-        localInstrumentor.disable();
       }
     });
 
@@ -806,5 +808,351 @@ describe('MastraInstrumentor', () => {
 
       writeSpy.mockRestore();
     });
+  });
+
+  // -------------------------------------------------------------------------
+  // Span grouping (lifecycle-aware)
+  // -------------------------------------------------------------------------
+
+  describe('span grouping (lifecycle)', () => {
+    it('span_started followed by span_ended creates exactly one OTel span and ends it', async () => {
+      const exporter = new NeatlogsMastraExporter(provider);
+      const spanData = makeSpan({ id: 'root-1', type: 'workflow_run', name: 'my.workflow' });
+
+      await exporter.exportTracingEvent({ type: 'span_started', exportedSpan: spanData });
+      expect(mockSpan.end).not.toHaveBeenCalled();
+
+      await exporter.exportTracingEvent({ type: 'span_ended', exportedSpan: { ...spanData, endTime: new Date('2024-01-01T00:00:05Z') } });
+      expect(mockSpan.end).toHaveBeenCalledTimes(1);
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('openinference.span.kind', 'WORKFLOW');
+
+      // Only one OTel span was started total
+      const tracer = (provider.getTracer as any).mock.results[0]?.value;
+      expect(tracer.startSpan).toHaveBeenCalledTimes(1);
+    });
+
+    it('child span_started receives parent context from the parent started span', async () => {
+      // Use a more detailed mock so we can track contexts
+      const parentSpanObj = createMockSpan();
+      const childSpanObj = createMockSpan();
+      let callCount = 0;
+      const tracerWithMultiSpan: any = {
+        startSpan: vi.fn((_name: string, _opts?: any, _ctx?: any) => {
+          callCount++;
+          return callCount === 1 ? parentSpanObj : childSpanObj;
+        }),
+      };
+      const multiProvider: TracerProvider = {
+        getTracer: vi.fn(() => tracerWithMultiSpan),
+      } as any;
+
+      const exporter = new NeatlogsMastraExporter(multiProvider);
+
+      // Start parent
+      await exporter.exportTracingEvent({
+        type: 'span_started',
+        exportedSpan: makeSpan({ id: 'parent-1', name: 'parent' }),
+      });
+
+      // Start child referencing parent
+      await exporter.exportTracingEvent({
+        type: 'span_started',
+        exportedSpan: makeSpan({ id: 'child-1', parentSpanId: 'parent-1', name: 'child' }),
+      });
+
+      // Verify child was started with a non-ROOT context (the parent's context)
+      const childStartCall = tracerWithMultiSpan.startSpan.mock.calls[1];
+      const childContext = childStartCall[2];
+      // The child context should not be ROOT_CONTEXT since parent existed
+      // It should contain the parent span
+      expect(childContext).toBeDefined();
+      // The context passed for child should not equal ROOT_CONTEXT (it has the parent span set)
+      const { ROOT_CONTEXT } = await import('@opentelemetry/api');
+      expect(childContext).not.toBe(ROOT_CONTEXT);
+    });
+
+    it('ended-only fallback with valid traceId and parentSpanId uses a non-recording parent context', async () => {
+      const validTraceId = 'a'.repeat(32);
+      const validParentSpanId = 'b'.repeat(16);
+
+      const tracerSpy: any = {
+        startSpan: vi.fn((_name: string, _opts?: any, _ctx?: any) => mockSpan),
+      };
+      const spyProvider: TracerProvider = {
+        getTracer: vi.fn(() => tracerSpy),
+      } as any;
+
+      const exporter = new NeatlogsMastraExporter(spyProvider);
+
+      // Send span_ended directly (no span_started) with valid parent IDs
+      await exporter.exportTracingEvent({
+        type: 'span_ended',
+        exportedSpan: makeSpan({
+          id: 'orphan-1',
+          traceId: validTraceId,
+          parentSpanId: validParentSpanId,
+          name: 'orphan.span',
+        }),
+      });
+
+      // The span should have been started with a context that is not ROOT_CONTEXT
+      const startCall = tracerSpy.startSpan.mock.calls[0];
+      const usedContext = startCall[2];
+      const { ROOT_CONTEXT } = await import('@opentelemetry/api');
+      expect(usedContext).not.toBe(ROOT_CONTEXT);
+    });
+
+    it('ended-only fallback with invalid IDs falls back to ROOT_CONTEXT', async () => {
+      const tracerSpy: any = {
+        startSpan: vi.fn((_name: string, _opts?: any, _ctx?: any) => mockSpan),
+      };
+      const spyProvider: TracerProvider = {
+        getTracer: vi.fn(() => tracerSpy),
+      } as any;
+
+      const exporter = new NeatlogsMastraExporter(spyProvider);
+
+      // Send span_ended with invalid IDs (non-hex, wrong length)
+      await exporter.exportTracingEvent({
+        type: 'span_ended',
+        exportedSpan: makeSpan({
+          id: 'orphan-2',
+          traceId: 'not-valid',
+          parentSpanId: 'also-invalid',
+          name: 'invalid.span',
+        }),
+      });
+
+      const startCall = tracerSpy.startSpan.mock.calls[0];
+      const usedContext = startCall[2];
+      const { ROOT_CONTEXT } = await import('@opentelemetry/api');
+      expect(usedContext).toBe(ROOT_CONTEXT);
+    });
+
+    it('missing-parent child start does not throw and does not leak active state after end', async () => {
+      const warnSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      const exporter = new NeatlogsMastraExporter(provider);
+
+      // Start child with non-existent parent — should not throw
+      await expect(
+        exporter.exportTracingEvent({
+          type: 'span_started',
+          exportedSpan: makeSpan({ id: 'orphan-child', parentSpanId: 'missing-parent', name: 'orphan' }),
+        }),
+      ).resolves.not.toThrow();
+
+      expect(exporter.activeSpanCount).toBe(1);
+
+      // End the orphan child
+      await exporter.exportTracingEvent({
+        type: 'span_ended',
+        exportedSpan: makeSpan({ id: 'orphan-child', parentSpanId: 'missing-parent', name: 'orphan', endTime: new Date() }),
+      });
+
+      expect(exporter.activeSpanCount).toBe(0);
+      warnSpy.mockRestore();
+    });
+
+    it('flush() does not end active spans (safe for mid-workflow calls)', async () => {
+      const exporter = new NeatlogsMastraExporter(provider);
+
+      // Start spans but don't end them
+      await exporter.exportTracingEvent({
+        type: 'span_started',
+        exportedSpan: makeSpan({ id: 'leak-1', name: 'leaked' }),
+      });
+      await exporter.exportTracingEvent({
+        type: 'span_started',
+        exportedSpan: makeSpan({ id: 'leak-2', name: 'leaked2' }),
+      });
+
+      expect(exporter.activeSpanCount).toBe(2);
+
+      await exporter.flush();
+
+      // flush() should NOT end active spans — they may still be in progress
+      expect(exporter.activeSpanCount).toBe(2);
+      expect(mockSpan.end).not.toHaveBeenCalled();
+    });
+
+    it('shutdown() ends and clears active spans', async () => {
+      const exporter = new NeatlogsMastraExporter(provider);
+
+      await exporter.exportTracingEvent({
+        type: 'span_started',
+        exportedSpan: makeSpan({ id: 'shutdown-1', name: 'to-shutdown' }),
+      });
+      await exporter.exportTracingEvent({
+        type: 'span_started',
+        exportedSpan: makeSpan({ id: 'shutdown-2', name: 'to-shutdown2' }),
+      });
+
+      expect(exporter.activeSpanCount).toBe(2);
+
+      await exporter.shutdown();
+
+      expect(exporter.activeSpanCount).toBe(0);
+      // shutdown() should end the spans
+      expect(mockSpan.end).toHaveBeenCalled();
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Real in-memory provider integration test
+// ---------------------------------------------------------------------------
+
+describe('NeatlogsMastraExporter (real provider)', () => {
+  it('all related Mastra spans share the same non-zero traceId with valid parent-child relationships', async () => {
+    const { BasicTracerProvider, SimpleSpanProcessor, InMemorySpanExporter } = await import('@opentelemetry/sdk-trace-base');
+
+    const memExporter = new InMemorySpanExporter();
+    const tracerProvider = new BasicTracerProvider();
+    tracerProvider.addSpanProcessor(new SimpleSpanProcessor(memExporter));
+
+    const exporter = new NeatlogsMastraExporter(tracerProvider);
+
+    const now = Date.now();
+
+    // Simulate a Mastra workflow with parent → child spans
+    // 1. Start parent (workflow_run)
+    await exporter.exportTracingEvent({
+      type: 'span_started',
+      exportedSpan: {
+        id: 'wf-root',
+        traceId: 'mastra-trace-1',
+        name: 'my-workflow',
+        type: 'workflow_run',
+        startTime: new Date(now),
+        isRootSpan: true,
+        attributes: {},
+      },
+    });
+
+    // 2. Start child 1 (agent_run)
+    await exporter.exportTracingEvent({
+      type: 'span_started',
+      exportedSpan: {
+        id: 'agent-1',
+        traceId: 'mastra-trace-1',
+        parentSpanId: 'wf-root',
+        name: 'my-agent',
+        type: 'agent_run',
+        startTime: new Date(now + 10),
+        isRootSpan: false,
+        attributes: {},
+      },
+    });
+
+    // 3. Start child 2 (tool_call, child of agent)
+    await exporter.exportTracingEvent({
+      type: 'span_started',
+      exportedSpan: {
+        id: 'tool-1',
+        traceId: 'mastra-trace-1',
+        parentSpanId: 'agent-1',
+        name: 'get_weather',
+        type: 'tool_call',
+        startTime: new Date(now + 20),
+        isRootSpan: false,
+        attributes: {},
+      },
+    });
+
+    // 4. End tool
+    await exporter.exportTracingEvent({
+      type: 'span_ended',
+      exportedSpan: {
+        id: 'tool-1',
+        traceId: 'mastra-trace-1',
+        parentSpanId: 'agent-1',
+        name: 'get_weather',
+        type: 'tool_call',
+        startTime: new Date(now + 20),
+        endTime: new Date(now + 50),
+        isRootSpan: false,
+        attributes: {},
+        output: { result: 'sunny' },
+      },
+    });
+
+    // 5. End agent
+    await exporter.exportTracingEvent({
+      type: 'span_ended',
+      exportedSpan: {
+        id: 'agent-1',
+        traceId: 'mastra-trace-1',
+        parentSpanId: 'wf-root',
+        name: 'my-agent',
+        type: 'agent_run',
+        startTime: new Date(now + 10),
+        endTime: new Date(now + 100),
+        isRootSpan: false,
+        attributes: {},
+        output: { message: 'done' },
+      },
+    });
+
+    // 6. End workflow
+    await exporter.exportTracingEvent({
+      type: 'span_ended',
+      exportedSpan: {
+        id: 'wf-root',
+        traceId: 'mastra-trace-1',
+        name: 'my-workflow',
+        type: 'workflow_run',
+        startTime: new Date(now),
+        endTime: new Date(now + 150),
+        isRootSpan: true,
+        attributes: {},
+        output: { status: 'completed' },
+      },
+    });
+
+    // Force flush to ensure all spans are exported
+    await tracerProvider.forceFlush();
+
+    const spans = memExporter.getFinishedSpans();
+
+    // Exactly 3 OTel spans produced (one per Mastra span)
+    expect(spans).toHaveLength(3);
+
+    // All share the same non-zero traceId
+    const traceIds = new Set(spans.map(s => s.spanContext().traceId));
+    expect(traceIds.size).toBe(1);
+    const traceId = [...traceIds][0];
+    expect(traceId).not.toMatch(/^0+$/);
+    expect(traceId).toHaveLength(32);
+
+    // No all-zero span IDs
+    for (const span of spans) {
+      expect(span.spanContext().spanId).not.toMatch(/^0+$/);
+      expect(span.spanContext().spanId).toHaveLength(16);
+    }
+
+    // Verify parent-child relationships
+    const rootSpan = spans.find(s => s.name === 'my-workflow')!;
+    const agentSpan = spans.find(s => s.name === 'my-agent')!;
+    const toolSpan = spans.find(s => s.name === 'get_weather')!;
+
+    expect(rootSpan).toBeDefined();
+    expect(agentSpan).toBeDefined();
+    expect(toolSpan).toBeDefined();
+
+    // Agent's parentSpanId should be the workflow's spanId
+    expect(agentSpan.parentSpanId).toBe(rootSpan.spanContext().spanId);
+
+    // Tool's parentSpanId should be the agent's spanId
+    expect(toolSpan.parentSpanId).toBe(agentSpan.spanContext().spanId);
+
+    // Root span should have no parent (undefined or zero-padded)
+    expect(
+      rootSpan.parentSpanId === undefined ||
+      rootSpan.parentSpanId === '' ||
+      /^0{16}$/.test(rootSpan.parentSpanId)
+    ).toBe(true);
+
+    // Cleanup
+    await tracerProvider.shutdown();
   });
 });

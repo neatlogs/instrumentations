@@ -17,7 +17,11 @@
       }
     }
   },
-  "files": ["dist/", "README.md", "LICENSE"],
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "npm run build:esm && npm run build:cjs",
     "build:esm": "tsc -p tsconfig.esm.json && echo '{\"type\":\"module\"}' > dist/esm/package.json",
@@ -25,9 +29,19 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "example:grouped": "NEATLOGS_DISABLE_EXPORT=true npx tsx examples/grouped-workflow.ts",
+    "verify:grouped": "node scripts/verify-grouped-example.mjs"
   },
-  "keywords": ["opentelemetry", "instrumentation", "mastra", "ai", "agent", "neatlogs", "tracing"],
+  "keywords": [
+    "opentelemetry",
+    "instrumentation",
+    "mastra",
+    "ai",
+    "agent",
+    "neatlogs",
+    "tracing"
+  ],
   "license": "MIT",
   "dependencies": {
     "@opentelemetry/api": "^1.9.0"
@@ -45,11 +59,15 @@
     }
   },
   "devDependencies": {
+    "@mastra/core": "1.25.0",
     "@mastra/observability": ">=1.0.0 <1.6.0",
     "@opentelemetry/sdk-trace-base": "^1.30.0",
     "@opentelemetry/sdk-trace-node": "^1.30.0",
+    "neatlogs": "file:/code/neatlogs/neatlogs-typescript",
+    "tsx": "^4.21.0",
     "typescript": "^5.7.0",
-    "vitest": "^3.0.0"
+    "vitest": "^3.0.0",
+    "zod": "^4.1.13"
   },
   "engines": {
     "node": ">=18.0.0"

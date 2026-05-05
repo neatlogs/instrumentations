@@ -1,0 +1,6 @@
+# Generated logs from examples
+logs/
+
+# Environment files
+.env
+.env.*

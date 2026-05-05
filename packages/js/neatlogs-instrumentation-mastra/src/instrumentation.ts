@@ -18,9 +18,13 @@
 import {
   type Tracer,
   type TracerProvider,
+  type Span,
+  type Context,
   SpanKind,
   SpanStatusCode,
-  context,
+  TraceFlags,
+  trace,
+  ROOT_CONTEXT,
 } from '@opentelemetry/api';
 
 // ---------------------------------------------------------------------------
@@ -165,10 +169,24 @@ function _safeStringify(value: any, maxLen = 100_000): string {
  * Receives AnyExportedSpan from Mastra's internal observability,
  * converts to OpenInference OTel attributes, and creates OTel spans
  * on the provided TracerProvider.
+ *
+ * Lifecycle-aware: processes `span_started` events to open OTel spans
+ * immediately and `span_ended` events to finalize them, enabling proper
+ * parent-child relationships within a single trace.
  */
 export class NeatlogsMastraExporter {
   name = 'neatlogs';
   private _tracer: Tracer;
+
+  /**
+   * Active spans keyed by Mastra span.id.
+   * Stored on span_started so that child spans can look up their parent context.
+   */
+  private _activeSpans: Map<string, { span: Span; context: Context }> = new Map();
+
+  /** Bounded counter for orphan warnings (avoids log spam). */
+  private _orphanWarnings = 0;
+  private static readonly MAX_ORPHAN_WARNINGS = 10;
 
   constructor(tracerProvider: TracerProvider) {
     this._tracer = tracerProvider.getTracer('openinference.instrumentation.mastra');
@@ -176,13 +194,20 @@ export class NeatlogsMastraExporter {
 
   // BaseExporter interface methods
   async exportTracingEvent(event: any): Promise<void> {
-    // Only process completed spans
-    if (event.type !== 'span_ended') return;
-    const span = event.exportedSpan;
-    if (!span) return;
+    if (!event || !event.type) return;
 
     try {
-      this._processSpan(span);
+      switch (event.type) {
+        case 'span_started':
+          this._handleSpanStarted(event.exportedSpan);
+          break;
+        case 'span_ended':
+          this._handleSpanEnded(event.exportedSpan);
+          break;
+        // span_updated: ignore for now
+        default:
+          break;
+      }
     } catch (err) {
       // best-effort — never let exporter errors surface to user code
     }
@@ -192,66 +217,191 @@ export class NeatlogsMastraExporter {
     return this.exportTracingEvent(event);
   }
 
-  private _processSpan(span: any): void {
-    const oiKind = getOiKind(span.type ?? 'generic');
-    const spanName = span.name ?? span.type ?? 'mastra.span';
+  // -------------------------------------------------------------------------
+  // Lifecycle: span_started
+  // -------------------------------------------------------------------------
 
-    // Note: Mastra's span_ended events include parentSpanId but we only receive
-    // completed spans. Parent-child OTel hierarchy relies on the ambient OTel
-    // context; reconstructing it from Mastra trace/span IDs would require
-    // processing span_started events and holding OTel spans open until span_ended.
+  private _handleSpanStarted(mastraSpan: any): void {
+    if (!mastraSpan || !mastraSpan.id) return;
+
+    const spanName = mastraSpan.name ?? mastraSpan.type ?? 'mastra.span';
+
+    // Determine parent context
+    let parentContext: Context = ROOT_CONTEXT;
+    if (mastraSpan.parentSpanId) {
+      const parentEntry = this._activeSpans.get(mastraSpan.parentSpanId);
+      if (parentEntry) {
+        parentContext = parentEntry.context;
+      } else {
+        // Parent not yet available (out-of-order or missing).
+        // Start from root — bounded warning.
+        this._warnOrphan(mastraSpan.id, mastraSpan.parentSpanId);
+      }
+    }
+
     const otelSpan = this._tracer.startSpan(
       spanName,
       {
         kind: SpanKind.INTERNAL,
-        startTime: span.startTime ? new Date(span.startTime).getTime() : undefined,
+        startTime: mastraSpan.startTime ? new Date(mastraSpan.startTime).getTime() : undefined,
       },
-      context.active(),
+      parentContext,
     );
+
+    // Store span and its context (context with this span set as active)
+    const spanContext = trace.setSpan(parentContext, otelSpan);
+    this._activeSpans.set(mastraSpan.id, { span: otelSpan, context: spanContext });
+  }
+
+  // -------------------------------------------------------------------------
+  // Lifecycle: span_ended
+  // -------------------------------------------------------------------------
+
+  private _handleSpanEnded(mastraSpan: any): void {
+    if (!mastraSpan) return;
+
+    const activeEntry = mastraSpan.id ? this._activeSpans.get(mastraSpan.id) : undefined;
+
+    if (activeEntry) {
+      // We have the stored span from span_started — finalize it
+      this._finalizeSpan(activeEntry.span, mastraSpan);
+      this._activeSpans.delete(mastraSpan.id);
+    } else {
+      // Ended-only fallback: no span_started was received for this span
+      this._processEndedOnlySpan(mastraSpan);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Ended-only fallback
+  // -------------------------------------------------------------------------
+
+  private _processEndedOnlySpan(mastraSpan: any): void {
+    const spanName = mastraSpan.name ?? mastraSpan.type ?? 'mastra.span';
+
+    // Determine best parent context for ended-only spans
+    let parentContext: Context = ROOT_CONTEXT;
+
+    if (mastraSpan.parentSpanId) {
+      // Check if parent is still active (possible in mixed mode)
+      const parentEntry = this._activeSpans.get(mastraSpan.parentSpanId);
+      if (parentEntry) {
+        parentContext = parentEntry.context;
+      } else if (this._isValidTraceId(mastraSpan.traceId) && this._isValidSpanId(mastraSpan.parentSpanId)) {
+        // Construct a non-recording parent context from Mastra IDs
+        parentContext = trace.setSpanContext(ROOT_CONTEXT, {
+          traceId: mastraSpan.traceId,
+          spanId: mastraSpan.parentSpanId,
+          traceFlags: TraceFlags.SAMPLED,
+          isRemote: true,
+        });
+      }
+      // Otherwise fall back to ROOT_CONTEXT — ended-only streams cannot always be tree-grouped.
+    }
+
+    const otelSpan = this._tracer.startSpan(
+      spanName,
+      {
+        kind: SpanKind.INTERNAL,
+        startTime: mastraSpan.startTime ? new Date(mastraSpan.startTime).getTime() : undefined,
+      },
+      parentContext,
+    );
+
+    this._finalizeSpan(otelSpan, mastraSpan);
+  }
+
+  // -------------------------------------------------------------------------
+  // Shared finalization (attributes, status, end)
+  // -------------------------------------------------------------------------
+
+  private _finalizeSpan(otelSpan: Span, mastraSpan: any): void {
+    const oiKind = getOiKind(mastraSpan.type ?? 'generic');
 
     // Core OpenInference attributes
     otelSpan.setAttribute('openinference.span.kind', oiKind);
 
     // Entity info
-    if (span.entityName) {
-      otelSpan.setAttribute('mastra.entity.name', span.entityName);
+    if (mastraSpan.entityName) {
+      otelSpan.setAttribute('mastra.entity.name', mastraSpan.entityName);
     }
-    if (span.entityType) {
-      otelSpan.setAttribute('mastra.entity.type', span.entityType);
+    if (mastraSpan.entityType) {
+      otelSpan.setAttribute('mastra.entity.type', mastraSpan.entityType);
     }
 
     // Span-type-specific attributes
-    this._setTypeAttributes(otelSpan, span);
+    this._setTypeAttributes(otelSpan, mastraSpan);
 
     // Input / output
-    this._setInputOutput(otelSpan, span);
+    this._setInputOutput(otelSpan, mastraSpan);
 
     // Error handling
-    if (span.errorInfo) {
+    if (mastraSpan.errorInfo) {
       otelSpan.setStatus({
         code: SpanStatusCode.ERROR,
-        message: span.errorInfo.message,
+        message: mastraSpan.errorInfo.message,
       });
-      otelSpan.recordException(new Error(span.errorInfo.message));
+      otelSpan.recordException(new Error(mastraSpan.errorInfo.message));
     } else {
       otelSpan.setStatus({ code: SpanStatusCode.OK });
     }
 
     // Metadata as JSON
-    if (span.metadata && Object.keys(span.metadata).length > 0) {
+    if (mastraSpan.metadata && Object.keys(mastraSpan.metadata).length > 0) {
       try {
-        otelSpan.setAttribute('metadata', JSON.stringify(span.metadata));
+        otelSpan.setAttribute('metadata', JSON.stringify(mastraSpan.metadata));
       } catch {
         // best-effort
       }
     }
 
     // Tags (root spans only)
-    if (Array.isArray(span.tags) && span.tags.length > 0) {
-      otelSpan.setAttribute('tag.tags', span.tags);
+    if (Array.isArray(mastraSpan.tags) && mastraSpan.tags.length > 0) {
+      otelSpan.setAttribute('tag.tags', mastraSpan.tags);
     }
 
-    otelSpan.end(span.endTime ? new Date(span.endTime).getTime() : undefined);
+    otelSpan.end(mastraSpan.endTime ? new Date(mastraSpan.endTime).getTime() : undefined);
+  }
+
+  // -------------------------------------------------------------------------
+  // Validation helpers
+  // -------------------------------------------------------------------------
+
+  /** Check if a hex ID (trace or span) is valid: expectedLength hex chars, non-zero */
+  private _isValidHexId(value: any, expectedLength: number): boolean {
+    if (typeof value !== 'string') return false;
+    if (value.length !== expectedLength) return false;
+    if (!new RegExp(`^[0-9a-f]{${expectedLength}}$`).test(value)) return false;
+    if (/^0+$/.test(value)) return false;
+    return true;
+  }
+
+  private _isValidTraceId(traceId: any): boolean {
+    return this._isValidHexId(traceId, 32);
+  }
+
+  private _isValidSpanId(spanId: any): boolean {
+    return this._isValidHexId(spanId, 16);
+  }
+
+  // -------------------------------------------------------------------------
+  // Orphan warning (bounded)
+  // -------------------------------------------------------------------------
+
+  private _warnOrphan(spanId: string, parentSpanId: string): void {
+    if (this._orphanWarnings < NeatlogsMastraExporter.MAX_ORPHAN_WARNINGS) {
+      this._orphanWarnings++;
+      _warn(`span_started for "${spanId}" references missing parent "${parentSpanId}" — starting from root.`);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Active span count (exposed for testing)
+  // -------------------------------------------------------------------------
+
+  /** Returns the number of currently active (started but not ended) spans. */
+  get activeSpanCount(): number {
+    return this._activeSpans.size;
   }
 
   private _setTypeAttributes(otelSpan: any, span: any): void {
@@ -401,8 +551,28 @@ export class NeatlogsMastraExporter {
     }
   }
 
-  async flush(): Promise<void> {}
-  async shutdown(): Promise<void> {}
+  async flush(): Promise<void> {
+    // No-op for active spans — flush() is a normal "drain pending data" lifecycle
+    // hook that may be called while workflow spans are still open.  Ending active
+    // spans here would corrupt in-progress Mastra traces.  Active-span cleanup is
+    // reserved for shutdown().
+  }
+
+  async shutdown(): Promise<void> {
+    // End and clear any active spans that were started but never ended.
+    // This is only safe during final teardown when no more span events will arrive.
+    for (const [_id, entry] of this._activeSpans) {
+      try {
+        entry.span.setStatus({ code: SpanStatusCode.UNSET });
+        entry.span.end();
+      } catch {
+        // best-effort
+      }
+    }
+    this._activeSpans.clear();
+  }
+
+  /** No-op stub required to satisfy the BaseExporter duck-type interface. */
   init?(_options: any): void {}
 }
 
@@ -494,6 +664,21 @@ export class MastraInstrumentor {
     }
   }
 
+  /**
+   * Clean up state and emit a warning when constructor patching fails.
+   * The shared suffix directs users to the manual observability injection path.
+   */
+  private _patchFailed(reason: string): void {
+    this._origMastraConstructor = null;
+    this._mastraModule = null;
+    _warn(
+      `Cannot patch @mastra/core: ${reason}. ` +
+      'Mastra spans will not be collected. ' +
+      'Use `createNeatlogsMastraObservability()` and pass the result to ' +
+      'new Mastra({ observability: ... }) directly instead.',
+    );
+  }
+
   disable(): void {
     if (this._mastraModule && this._origMastraConstructor) {
       // Restore the original constructor on the module export.
@@ -580,14 +765,9 @@ export class MastraInstrumentor {
       // This includes CJS bundles whose exports namespace is sealed, where the
       // descriptor has configurable:false, writable:true but no getter —
       // assignment still throws in strict mode and defineProperty is blocked.
-      this._origMastraConstructor = null;
-      this._mastraModule = null;
-      _warn(
-        'Cannot patch @mastra/core: the "Mastra" export is non-configurable ' +
-        '(module exports are sealed). Constructor patching is not possible. ' +
-        'Mastra spans will not be collected. ' +
-        'Use `createNeatlogsMastraObservability()` and pass the result to ' +
-        'new Mastra({ observability: ... }) directly instead.',
+      this._patchFailed(
+        'the "Mastra" export is non-configurable ' +
+        '(module exports are sealed). Constructor patching is not possible',
       );
       return;
     }
@@ -603,14 +783,9 @@ export class MastraInstrumentor {
         });
       } catch {
         // best-effort — module exports may be non-configurable in some environments
-        this._origMastraConstructor = null;
-        this._mastraModule = null;
-        _warn(
-          'Cannot patch @mastra/core: all attempts to replace the "Mastra" ' +
-          'export on the module object threw errors. ' +
-          'Mastra spans will not be collected. ' +
-          'Use `createNeatlogsMastraObservability()` and pass the result to ' +
-          'new Mastra({ observability: ... }) directly instead.',
+        this._patchFailed(
+          'all attempts to replace the "Mastra" ' +
+          'export on the module object threw errors',
         );
         return;
       }
@@ -618,14 +793,9 @@ export class MastraInstrumentor {
 
     // Verify the patch actually took effect (guards against silent no-ops)
     if (mastraModule.Mastra !== PatchedMastra) {
-      this._origMastraConstructor = null;
-      this._mastraModule = null;
-      _warn(
-        'Cannot patch @mastra/core: the "Mastra" export was not replaced ' +
-        'after assignment (silent no-op). ' +
-        'Mastra spans will not be collected. ' +
-        'Use `createNeatlogsMastraObservability()` and pass the result to ' +
-        'new Mastra({ observability: ... }) directly instead.',
+      this._patchFailed(
+        'the "Mastra" export was not replaced ' +
+        'after assignment (silent no-op)',
       );
     }
   }
