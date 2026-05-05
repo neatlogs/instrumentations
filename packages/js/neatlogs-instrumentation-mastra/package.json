@@ -20,7 +20,7 @@
   "files": ["dist/", "README.md", "LICENSE"],
   "scripts": {
     "build": "npm run build:esm && npm run build:cjs",
-    "build:esm": "tsc -p tsconfig.esm.json",
+    "build:esm": "tsc -p tsconfig.esm.json && echo '{\"type\":\"module\"}' > dist/esm/package.json",
     "build:cjs": "tsc -p tsconfig.cjs.json",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -34,7 +34,7 @@
   },
   "peerDependencies": {
     "@mastra/core": ">=1.0.0",
-    "@mastra/observability": ">=1.0.0"
+    "@mastra/observability": ">=1.0.0 <1.6.0"
   },
   "peerDependenciesMeta": {
     "@mastra/core": {
@@ -45,6 +45,7 @@
     }
   },
   "devDependencies": {
+    "@mastra/observability": ">=1.0.0 <1.6.0",
     "@opentelemetry/sdk-trace-base": "^1.30.0",
     "@opentelemetry/sdk-trace-node": "^1.30.0",
     "typescript": "^5.7.0",

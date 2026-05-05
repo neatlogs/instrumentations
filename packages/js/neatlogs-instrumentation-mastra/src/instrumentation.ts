@@ -21,7 +21,6 @@ import {
   SpanKind,
   SpanStatusCode,
   context,
-  trace,
 } from '@opentelemetry/api';
 
 // ---------------------------------------------------------------------------
@@ -135,6 +134,19 @@ function flattenMessages(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** Best-effort warning to stderr/console; never throws. */
+function _warn(msg: string): void {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const g = globalThis as any;
+    if (typeof g.process?.stderr?.write === 'function') {
+      g.process.stderr.write(`[neatlogs] ${msg}\n`);
+    } else if (typeof g.console?.warn === 'function') {
+      g.console.warn(`[neatlogs] ${msg}`);
+    }
+  } catch { /* best-effort */ }
+}
+
 function _safeStringify(value: any, maxLen = 100_000): string {
   if (typeof value === 'string') return value.slice(0, maxLen);
   try {
@@ -157,8 +169,6 @@ function _safeStringify(value: any, maxLen = 100_000): string {
 export class NeatlogsMastraExporter {
   name = 'neatlogs';
   private _tracer: Tracer;
-  // Track active OTel spans by Mastra span ID so child spans can be parented correctly
-  private _activeSpans: Map<string, any> = new Map();
 
   constructor(tracerProvider: TracerProvider) {
     this._tracer = tracerProvider.getTracer('openinference.instrumentation.mastra');
@@ -166,14 +176,6 @@ export class NeatlogsMastraExporter {
 
   // BaseExporter interface methods
   async exportTracingEvent(event: any): Promise<void> {
-    return this._exportTracingEvent(event);
-  }
-
-  onTracingEvent(event: any): void | Promise<void> {
-    return this.exportTracingEvent(event);
-  }
-
-  async _exportTracingEvent(event: any): Promise<void> {
     // Only process completed spans
     if (event.type !== 'span_ended') return;
     const span = event.exportedSpan;
@@ -186,25 +188,25 @@ export class NeatlogsMastraExporter {
     }
   }
 
+  onTracingEvent(event: any): void | Promise<void> {
+    return this.exportTracingEvent(event);
+  }
+
   private _processSpan(span: any): void {
     const oiKind = getOiKind(span.type ?? 'generic');
     const spanName = span.name ?? span.type ?? 'mastra.span';
 
-    // Determine parent context: use parent OTel span if we tracked one
-    const parentOtelSpan = span.parentSpanId
-      ? this._activeSpans.get(span.parentSpanId)
-      : undefined;
-    const parentCtx = parentOtelSpan
-      ? trace.setSpan(context.active(), parentOtelSpan)
-      : context.active();
-
+    // Note: Mastra's span_ended events include parentSpanId but we only receive
+    // completed spans. Parent-child OTel hierarchy relies on the ambient OTel
+    // context; reconstructing it from Mastra trace/span IDs would require
+    // processing span_started events and holding OTel spans open until span_ended.
     const otelSpan = this._tracer.startSpan(
       spanName,
       {
         kind: SpanKind.INTERNAL,
         startTime: span.startTime ? new Date(span.startTime).getTime() : undefined,
       },
-      parentCtx,
+      context.active(),
     );
 
     // Core OpenInference attributes
@@ -250,9 +252,6 @@ export class NeatlogsMastraExporter {
     }
 
     otelSpan.end(span.endTime ? new Date(span.endTime).getTime() : undefined);
-
-    // Clean up tracking
-    this._activeSpans.delete(span.id);
   }
 
   private _setTypeAttributes(otelSpan: any, span: any): void {
@@ -408,6 +407,55 @@ export class NeatlogsMastraExporter {
 }
 
 // ---------------------------------------------------------------------------
+// createNeatlogsMastraObservability helper
+// ---------------------------------------------------------------------------
+
+export interface CreateObservabilityOptions {
+  /** Supply a pre-built exporter instead of auto-creating one. */
+  exporter?: NeatlogsMastraExporter;
+  /** @internal — inject the @mastra/observability module (for testing). */
+  _observabilityModule?: any;
+}
+
+/**
+ * Dynamically requires @mastra/observability and constructs an Observability
+ * instance wired with a NeatlogsMastraExporter.
+ *
+ * Returns `{ observability, exporter }` where `observability` is a real
+ * Observability instance whose `getDefaultInstance().getExporters()` contains
+ * the exporter.
+ *
+ * Throws if @mastra/observability is unavailable or Observability is not a
+ * constructor.
+ */
+export function createNeatlogsMastraObservability(
+  tracerProvider: TracerProvider,
+  options?: CreateObservabilityOptions,
+): { observability: any; exporter: NeatlogsMastraExporter } {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const obsModule = options?._observabilityModule ?? require('@mastra/observability');
+  const Observability = obsModule?.Observability ?? obsModule?.default?.Observability;
+
+  if (typeof Observability !== 'function') {
+    throw new Error(
+      '@mastra/observability does not export a valid Observability constructor',
+    );
+  }
+
+  const exporter = options?.exporter ?? new NeatlogsMastraExporter(tracerProvider);
+  const observability = new Observability({
+    configs: {
+      default: {
+        serviceName: 'mastra',
+        exporters: [exporter],
+      },
+    },
+  });
+
+  return { observability, exporter };
+}
+
+// ---------------------------------------------------------------------------
 // MastraInstrumentor
 // ---------------------------------------------------------------------------
 
@@ -417,6 +465,8 @@ export interface MastraInstrumentorOptions {
   _module?: any;
   /** @internal — for testing only; inject a pre-built exporter instance. */
   _exporter?: any;
+  /** @internal — for testing only; inject the @mastra/observability module. */
+  _observabilityModule?: any;
 }
 
 /**
@@ -482,15 +532,22 @@ export class MastraInstrumentor {
 
       // Only inject if user hasn't configured their own observability
       if (!cfg.observability) {
-        const exporter = options._exporter ?? new NeatlogsMastraExporter(provider);
-        cfg.observability = {
-          configs: {
-            default: {
-              serviceName: 'mastra',
-              exporters: [exporter],
-            },
-          },
-        };
+        try {
+          const result = createNeatlogsMastraObservability(provider, {
+            exporter: options._exporter,
+            _observabilityModule: options._observabilityModule,
+          });
+          cfg.observability = result.observability;
+        } catch (e) {
+          // @mastra/observability unavailable or invalid — skip injection,
+          // construct original Mastra without adding an invalid plain object.
+          // Emit a visible warning so users know Mastra spans won't be produced.
+          const msg = e instanceof Error ? e.message : String(e);
+          _warn(
+            `Mastra instrumentation could not activate: ${msg}. ` +
+            'Install @mastra/observability to enable Mastra span collection.',
+          );
+        }
       }
 
       // Call the original constructor with the (possibly modified) config
@@ -513,15 +570,63 @@ export class MastraInstrumentor {
     }
 
     // Replace the Mastra constructor on the module with the wrapper.
-    // Use Object.defineProperty as a fallback for read-only ES module exports.
+    // Some module exports (e.g. CJS bundles, ESM re-exports) may have
+    // non-configurable property descriptors.  We check first and bail early
+    // rather than letting assignment/defineProperty throw unpredictably.
+    const desc = Object.getOwnPropertyDescriptor(mastraModule, 'Mastra');
+    if (desc && !desc.configurable) {
+      // Non-configurable property — neither direct assignment (throws in strict
+      // mode) nor Object.defineProperty (throws TypeError) can replace it.
+      // This includes CJS bundles whose exports namespace is sealed, where the
+      // descriptor has configurable:false, writable:true but no getter —
+      // assignment still throws in strict mode and defineProperty is blocked.
+      this._origMastraConstructor = null;
+      this._mastraModule = null;
+      _warn(
+        'Cannot patch @mastra/core: the "Mastra" export is non-configurable ' +
+        '(module exports are sealed). Constructor patching is not possible. ' +
+        'Mastra spans will not be collected. ' +
+        'Use `createNeatlogsMastraObservability()` and pass the result to ' +
+        'new Mastra({ observability: ... }) directly instead.',
+      );
+      return;
+    }
+
     try {
       mastraModule.Mastra = PatchedMastra;
     } catch {
-      Object.defineProperty(mastraModule, 'Mastra', {
-        value: PatchedMastra,
-        writable: true,
-        configurable: true,
-      });
+      try {
+        Object.defineProperty(mastraModule, 'Mastra', {
+          value: PatchedMastra,
+          writable: true,
+          configurable: true,
+        });
+      } catch {
+        // best-effort — module exports may be non-configurable in some environments
+        this._origMastraConstructor = null;
+        this._mastraModule = null;
+        _warn(
+          'Cannot patch @mastra/core: all attempts to replace the "Mastra" ' +
+          'export on the module object threw errors. ' +
+          'Mastra spans will not be collected. ' +
+          'Use `createNeatlogsMastraObservability()` and pass the result to ' +
+          'new Mastra({ observability: ... }) directly instead.',
+        );
+        return;
+      }
+    }
+
+    // Verify the patch actually took effect (guards against silent no-ops)
+    if (mastraModule.Mastra !== PatchedMastra) {
+      this._origMastraConstructor = null;
+      this._mastraModule = null;
+      _warn(
+        'Cannot patch @mastra/core: the "Mastra" export was not replaced ' +
+        'after assignment (silent no-op). ' +
+        'Mastra spans will not be collected. ' +
+        'Use `createNeatlogsMastraObservability()` and pass the result to ' +
+        'new Mastra({ observability: ... }) directly instead.',
+      );
     }
   }
 }

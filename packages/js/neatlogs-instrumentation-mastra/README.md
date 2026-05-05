@@ -6,36 +6,60 @@ Enriches Mastra agent, workflow, and tool spans with OpenInference-compatible at
 
 ## How It Works
 
-Mastra already has built-in OpenTelemetry tracing via `@mastra/otel-bridge`. This instrumentor uses a **context-aware approach**:
+Mastra supports custom observability backends via its `@mastra/observability` package. This instrumentor injects a `NeatlogsMastraExporter` (a `BaseExporter`) into Mastra's observability layer at construction time, so every agent, workflow, and tool span is forwarded to the Neatlogs exporter.
 
-- **When Mastra's OtelBridge is active**: enriches existing spans with OpenInference attributes (no duplicate spans)
-- **When OtelBridge is not configured**: creates its own spans with full attribute coverage
-
-This means you can use this instrumentor alongside Mastra's built-in tracing without conflicts.
+> **Note on `@mastra/core@1.x` compatibility:** The `@mastra/core` package exports a sealed CJS module whose `Mastra` property descriptor is `configurable: false`. This makes constructor-level monkey-patching impossible. If you call `instrumentor.instrument(...)` against a real `@mastra/core@1.x` install, a `[neatlogs]` warning will be written to stderr and no spans will be collected. Use the **direct approach** below instead.
 
 ## Installation
 
 ```bash
-npm install @neatlogs/instrumentation-mastra
+npm install @neatlogs/instrumentation-mastra @mastra/observability
 # or
-pnpm add @neatlogs/instrumentation-mastra
+pnpm add @neatlogs/instrumentation-mastra @mastra/observability
 ```
 
 ## Usage
 
+### Recommended: direct `observability` injection
+
+Pass a pre-built `Observability` instance to the `Mastra` constructor. This is the only approach that works with the sealed `@mastra/core@1.x` CJS bundle:
+
+```typescript
+import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
+import { Mastra } from '@mastra/core';
+import { createNeatlogsMastraObservability } from '@neatlogs/instrumentation-mastra';
+
+const provider = new NodeTracerProvider();
+provider.register();
+
+const { observability } = createNeatlogsMastraObservability(provider);
+
+const mastra = new Mastra({
+  observability,
+  // ... other Mastra options
+});
+
+// All Mastra agent/workflow/tool calls are now traced via Neatlogs
+```
+
+### Alternative: using `MastraInstrumentor` (for patchable environments)
+
+`MastraInstrumentor` attempts to replace the `Mastra` export at the module level. This works only in environments where the module descriptor is configurable (e.g., mocked modules in tests):
+
 ```typescript
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { SimpleSpanProcessor, ConsoleSpanExporter } from '@opentelemetry/sdk-trace-base';
-import { MastraInstrumentation } from '@neatlogs/instrumentation-mastra';
+import MastraInstrumentor from '@neatlogs/instrumentation-mastra';
 
 const provider = new NodeTracerProvider();
 provider.addSpanProcessor(new SimpleSpanProcessor(new ConsoleSpanExporter()));
 provider.register();
 
-const instrumentation = new MastraInstrumentation();
-instrumentation.enable();
+const instrumentor = new MastraInstrumentor();
+instrumentor.instrument({ tracerProvider: provider });
 
-// Now all Mastra agent/workflow/tool calls are automatically traced
+// If @mastra/core exports are sealed, a [neatlogs] warning is emitted
+// and no patching occurs. Use the direct approach above instead.
 ```
 
 ## Captured Attributes

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { TracerProvider, Span } from '@opentelemetry/api';
 import { SpanStatusCode } from '@opentelemetry/api';
-import { MastraInstrumentor } from '../src/instrumentation.js';
+import { MastraInstrumentor, NeatlogsMastraExporter, createNeatlogsMastraObservability } from '../src/instrumentation.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -82,13 +82,62 @@ function makeEvent(span: any): any {
   return { type: 'span_ended', exportedSpan: span };
 }
 
-/** Create a mock @mastra/core module with a Mastra constructor. */
+/**
+ * Create a mock @mastra/core module with a Mastra constructor.
+ *
+ * Mimics real Mastra validation: accepts observability only when
+ * typeof observability.getDefaultInstance === 'function'; otherwise
+ * stores a no-op marker so tests can detect the difference.
+ */
 function createMockMastraModule() {
   function Mastra(this: any, config?: any) {
-    this.config = config ?? {};
+    const cfg = config ?? {};
+    if (
+      cfg.observability &&
+      typeof cfg.observability.getDefaultInstance === 'function'
+    ) {
+      this.config = cfg;
+    } else {
+      // Observability is missing or invalid — store config without it
+      const { observability: _dropped, ...rest } = cfg;
+      this.config = { ...rest, observability: undefined };
+    }
   }
   Mastra.prototype.getAgent = vi.fn();
   return { Mastra };
+}
+
+/**
+ * Create a mock @mastra/observability module that provides a minimal
+ * Observability constructor matching the real API shape.
+ */
+function createMockObservabilityModule() {
+  class MockObservabilityInstance {
+    private _exporters: any[];
+    constructor(exporters: any[]) {
+      this._exporters = exporters;
+    }
+    getExporters() {
+      return this._exporters;
+    }
+    createSpan() {
+      return {};
+    }
+  }
+
+  class Observability {
+    private _instance: MockObservabilityInstance;
+    constructor(opts: any) {
+      const defaultCfg = opts?.configs?.default;
+      this._instance = new MockObservabilityInstance(
+        defaultCfg?.exporters ?? [],
+      );
+    }
+    getDefaultInstance() {
+      return this._instance;
+    }
+  }
+  return { Observability };
 }
 
 // ---------------------------------------------------------------------------
@@ -100,12 +149,14 @@ describe('MastraInstrumentor', () => {
   let mockSpan: ReturnType<typeof createMockSpan>;
   let provider: TracerProvider;
   let mockModule: ReturnType<typeof createMockMastraModule>;
+  let mockObsModule: ReturnType<typeof createMockObservabilityModule>;
 
   beforeEach(() => {
     instrumentor = new MastraInstrumentor();
     mockSpan = createMockSpan();
     provider = createMockTracerProvider(mockSpan);
     mockModule = createMockMastraModule();
+    mockObsModule = createMockObservabilityModule();
   });
 
   afterEach(() => {
@@ -126,7 +177,11 @@ describe('MastraInstrumentor', () => {
 
     it('should patch the Mastra constructor', () => {
       const origMastra = mockModule.Mastra;
-      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
+      instrumentor.instrument({
+        tracerProvider: provider,
+        _module: mockModule,
+        _observabilityModule: mockObsModule,
+      });
       expect(mockModule.Mastra).not.toBe(origMastra);
     });
   });
@@ -136,35 +191,42 @@ describe('MastraInstrumentor', () => {
   // -------------------------------------------------------------------------
 
   describe('Mastra constructor injection', () => {
-    it('should inject exporter into observability config when none provided', () => {
-      const mockExporter = { name: 'neatlogs', exportTracingEvent: vi.fn() };
+    it('should inject observability with exporter accessible via getDefaultInstance().getExporters()', () => {
+      const mockExporter = new NeatlogsMastraExporter(provider);
 
       instrumentor.instrument({
         tracerProvider: provider,
         _module: mockModule,
         _exporter: mockExporter,
+        _observabilityModule: mockObsModule,
       });
 
       const instance = new (mockModule.Mastra as any)({ agents: {} });
 
-      expect(instance.config.observability).toEqual({
-        configs: {
-          default: {
-            serviceName: 'mastra',
-            exporters: [mockExporter],
-          },
-        },
-      });
+      // The injected observability must be a real Observability instance
+      expect(instance.config.observability).toBeDefined();
+      expect(typeof instance.config.observability.getDefaultInstance).toBe('function');
+
+      const defaultInstance = instance.config.observability.getDefaultInstance();
+      const exporters = defaultInstance.getExporters();
+      expect(exporters).toContain(mockExporter);
     });
 
     it('should NOT override user-configured observability', () => {
-      const mockExporter = { name: 'neatlogs', exportTracingEvent: vi.fn() };
-      const userObservability = { custom: true };
+      const mockExporter = new NeatlogsMastraExporter(provider);
+      // User provides a proper Observability-shaped object
+      const userObservability = {
+        getDefaultInstance: () => ({
+          getExporters: () => [],
+        }),
+        custom: true,
+      };
 
       instrumentor.instrument({
         tracerProvider: provider,
         _module: mockModule,
         _exporter: mockExporter,
+        _observabilityModule: mockObsModule,
       });
 
       const instance = new (mockModule.Mastra as any)({
@@ -176,12 +238,13 @@ describe('MastraInstrumentor', () => {
     });
 
     it('should preserve other config properties when injecting exporter', () => {
-      const mockExporter = { name: 'neatlogs', exportTracingEvent: vi.fn() };
+      const mockExporter = new NeatlogsMastraExporter(provider);
 
       instrumentor.instrument({
         tracerProvider: provider,
         _module: mockModule,
         _exporter: mockExporter,
+        _observabilityModule: mockObsModule,
       });
 
       const instance = new (mockModule.Mastra as any)({
@@ -194,22 +257,71 @@ describe('MastraInstrumentor', () => {
       expect(instance.config.observability).toBeDefined();
     });
 
-    it('should use exporters array (not bridge) in the injected config', () => {
-      const mockExporter = { name: 'neatlogs', exportTracingEvent: vi.fn() };
+    it('should contain exporter in getDefaultInstance().getExporters() array', () => {
+      const mockExporter = new NeatlogsMastraExporter(provider);
 
       instrumentor.instrument({
         tracerProvider: provider,
         _module: mockModule,
         _exporter: mockExporter,
+        _observabilityModule: mockObsModule,
       });
 
       const instance = new (mockModule.Mastra as any)({});
-      const defaultConfig = instance.config.observability?.configs?.default;
+      const defaultInstance = instance.config.observability.getDefaultInstance();
 
-      expect(defaultConfig).toBeDefined();
-      expect(Array.isArray(defaultConfig.exporters)).toBe(true);
-      expect(defaultConfig.exporters).toContain(mockExporter);
-      expect(defaultConfig.bridge).toBeUndefined();
+      expect(defaultInstance).toBeDefined();
+      const exporters = defaultInstance.getExporters();
+      expect(Array.isArray(exporters)).toBe(true);
+      expect(exporters).toContain(mockExporter);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // @mastra/observability fallback
+  // -------------------------------------------------------------------------
+
+  describe('@mastra/observability fallback', () => {
+    it('should skip injection when @mastra/observability is unavailable', () => {
+      // Provide an observability module that will cause require to fail
+      instrumentor.instrument({
+        tracerProvider: provider,
+        _module: mockModule,
+        _observabilityModule: {}, // No Observability export
+      });
+
+      const instance = new (mockModule.Mastra as any)({ agents: {} });
+
+      // observability should be undefined — not a plain object
+      expect(instance.config.observability).toBeUndefined();
+    });
+
+    it('should skip injection when Observability is not a function', () => {
+      instrumentor.instrument({
+        tracerProvider: provider,
+        _module: mockModule,
+        _observabilityModule: { Observability: 'not-a-function' },
+      });
+
+      const instance = new (mockModule.Mastra as any)({ agents: {} });
+      expect(instance.config.observability).toBeUndefined();
+    });
+
+    it('should skip injection when Observability constructor throws', () => {
+      const badObsModule = {
+        Observability: function () {
+          throw new Error('boom');
+        },
+      };
+
+      instrumentor.instrument({
+        tracerProvider: provider,
+        _module: mockModule,
+        _observabilityModule: badObsModule,
+      });
+
+      const instance = new (mockModule.Mastra as any)({ agents: {} });
+      expect(instance.config.observability).toBeUndefined();
     });
   });
 
@@ -218,11 +330,22 @@ describe('MastraInstrumentor', () => {
   // -------------------------------------------------------------------------
 
   describe('NeatlogsMastraExporter (via real exporter injection)', () => {
-    it('should ignore non-span_ended events', async () => {
-      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
-
+    /** Instrument, create a Mastra instance, and return the injected exporter. */
+    function setupExporter(): { instance: any; exporter: any } {
+      instrumentor.instrument({
+        tracerProvider: provider,
+        _module: mockModule,
+        _observabilityModule: mockObsModule,
+      });
       const instance = new (mockModule.Mastra as any)({});
-      const exporter = instance.config.observability.configs.default.exporters[0];
+      const exporter = instance.config.observability
+        .getDefaultInstance()
+        .getExporters()[0];
+      return { instance, exporter };
+    }
+
+    it('should ignore non-span_ended events', async () => {
+      const { exporter } = setupExporter();
 
       await exporter.exportTracingEvent({ type: 'span_started', exportedSpan: makeSpan() });
       await exporter.exportTracingEvent({ type: 'span_updated', exportedSpan: makeSpan() });
@@ -232,9 +355,7 @@ describe('MastraInstrumentor', () => {
     });
 
     it('should create an OTel span for span_ended events', async () => {
-      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
-      const instance = new (mockModule.Mastra as any)({});
-      const exporter = instance.config.observability.configs.default.exporters[0];
+      const { exporter } = setupExporter();
 
       await exporter.exportTracingEvent(makeEvent(makeSpan({ type: 'agent_run', name: 'my.agent' })));
 
@@ -271,10 +392,14 @@ describe('MastraInstrumentor', () => {
 
         const localInstrumentor = new MastraInstrumentor();
         const localModule = createMockMastraModule();
-        localInstrumentor.instrument({ tracerProvider: localProvider, _module: localModule });
+        localInstrumentor.instrument({
+          tracerProvider: localProvider,
+          _module: localModule,
+          _observabilityModule: createMockObservabilityModule(),
+        });
 
         const inst = new (localModule.Mastra as any)({});
-        const exp = inst.config.observability.configs.default.exporters[0];
+        const exp = inst.config.observability.getDefaultInstance().getExporters()[0];
         await exp.exportTracingEvent(makeEvent(makeSpan({ type: spanType })));
 
         expect(localSpan.setAttribute).toHaveBeenCalledWith('openinference.span.kind', expectedKind);
@@ -283,9 +408,7 @@ describe('MastraInstrumentor', () => {
     });
 
     it('should set LLM attributes for model_generation spans', async () => {
-      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
-      const instance = new (mockModule.Mastra as any)({});
-      const exporter = instance.config.observability.configs.default.exporters[0];
+      const { exporter } = setupExporter();
 
       await exporter.exportTracingEvent(makeEvent(makeSpan({
         type: 'model_generation',
@@ -314,9 +437,7 @@ describe('MastraInstrumentor', () => {
     });
 
     it('should flatten input messages to indexed attributes for LLM spans', async () => {
-      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
-      const instance = new (mockModule.Mastra as any)({});
-      const exporter = instance.config.observability.configs.default.exporters[0];
+      const { exporter } = setupExporter();
 
       await exporter.exportTracingEvent(makeEvent(makeSpan({
         type: 'model_generation',
@@ -338,9 +459,7 @@ describe('MastraInstrumentor', () => {
     });
 
     it('should flatten tool calls in output messages', async () => {
-      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
-      const instance = new (mockModule.Mastra as any)({});
-      const exporter = instance.config.observability.configs.default.exporters[0];
+      const { exporter } = setupExporter();
 
       await exporter.exportTracingEvent(makeEvent(makeSpan({
         type: 'model_generation',
@@ -366,9 +485,7 @@ describe('MastraInstrumentor', () => {
     });
 
     it('should set input.value / output.value for non-LLM spans', async () => {
-      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
-      const instance = new (mockModule.Mastra as any)({});
-      const exporter = instance.config.observability.configs.default.exporters[0];
+      const { exporter } = setupExporter();
 
       await exporter.exportTracingEvent(makeEvent(makeSpan({
         type: 'agent_run',
@@ -387,9 +504,7 @@ describe('MastraInstrumentor', () => {
     });
 
     it('should set session.id from conversationId on agent_run spans', async () => {
-      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
-      const instance = new (mockModule.Mastra as any)({});
-      const exporter = instance.config.observability.configs.default.exporters[0];
+      const { exporter } = setupExporter();
 
       await exporter.exportTracingEvent(makeEvent(makeSpan({
         type: 'agent_run',
@@ -400,9 +515,7 @@ describe('MastraInstrumentor', () => {
     });
 
     it('should set tool.name for tool_call spans', async () => {
-      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
-      const instance = new (mockModule.Mastra as any)({});
-      const exporter = instance.config.observability.configs.default.exporters[0];
+      const { exporter } = setupExporter();
 
       await exporter.exportTracingEvent(makeEvent(makeSpan({
         type: 'tool_call',
@@ -415,9 +528,7 @@ describe('MastraInstrumentor', () => {
     });
 
     it('should record error info on failed spans', async () => {
-      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
-      const instance = new (mockModule.Mastra as any)({});
-      const exporter = instance.config.observability.configs.default.exporters[0];
+      const { exporter } = setupExporter();
 
       await exporter.exportTracingEvent(makeEvent(makeSpan({
         type: 'agent_run',
@@ -432,9 +543,7 @@ describe('MastraInstrumentor', () => {
     });
 
     it('should set OK status on successful spans', async () => {
-      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
-      const instance = new (mockModule.Mastra as any)({});
-      const exporter = instance.config.observability.configs.default.exporters[0];
+      const { exporter } = setupExporter();
 
       await exporter.exportTracingEvent(makeEvent(makeSpan({ type: 'agent_run' })));
 
@@ -442,9 +551,7 @@ describe('MastraInstrumentor', () => {
     });
 
     it('should end the OTel span with the Mastra span endTime', async () => {
-      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
-      const instance = new (mockModule.Mastra as any)({});
-      const exporter = instance.config.observability.configs.default.exporters[0];
+      const { exporter } = setupExporter();
 
       const endTime = new Date('2024-06-01T12:00:05Z');
       await exporter.exportTracingEvent(makeEvent(makeSpan({ endTime })));
@@ -453,9 +560,7 @@ describe('MastraInstrumentor', () => {
     });
 
     it('should set metadata as JSON attribute when present', async () => {
-      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
-      const instance = new (mockModule.Mastra as any)({});
-      const exporter = instance.config.observability.configs.default.exporters[0];
+      const { exporter } = setupExporter();
 
       await exporter.exportTracingEvent(makeEvent(makeSpan({
         metadata: { userId: 'u-1', env: 'prod' },
@@ -468,9 +573,7 @@ describe('MastraInstrumentor', () => {
     });
 
     it('should set tag.tags when tags are present', async () => {
-      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
-      const instance = new (mockModule.Mastra as any)({});
-      const exporter = instance.config.observability.configs.default.exporters[0];
+      const { exporter } = setupExporter();
 
       await exporter.exportTracingEvent(makeEvent(makeSpan({
         tags: ['production', 'v2'],
@@ -478,6 +581,179 @@ describe('MastraInstrumentor', () => {
       })));
 
       expect(mockSpan.setAttribute).toHaveBeenCalledWith('tag.tags', ['production', 'v2']);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // createNeatlogsMastraObservability helper
+  // -------------------------------------------------------------------------
+
+  describe('createNeatlogsMastraObservability()', () => {
+    it('should return observability and exporter', () => {
+      const result = createNeatlogsMastraObservability(provider, {
+        _observabilityModule: mockObsModule,
+      });
+
+      expect(result.observability).toBeDefined();
+      expect(result.exporter).toBeInstanceOf(NeatlogsMastraExporter);
+    });
+
+    it('should have exporter accessible via getDefaultInstance().getExporters()', () => {
+      const result = createNeatlogsMastraObservability(provider, {
+        _observabilityModule: mockObsModule,
+      });
+
+      const exporters = result.observability.getDefaultInstance().getExporters();
+      expect(exporters).toContain(result.exporter);
+    });
+
+    it('should use provided exporter when options.exporter is supplied', () => {
+      const customExporter = new NeatlogsMastraExporter(provider);
+      const result = createNeatlogsMastraObservability(provider, {
+        exporter: customExporter,
+        _observabilityModule: mockObsModule,
+      });
+
+      expect(result.exporter).toBe(customExporter);
+      const exporters = result.observability.getDefaultInstance().getExporters();
+      expect(exporters).toContain(customExporter);
+    });
+
+    it('should throw when @mastra/observability is missing', () => {
+      expect(() =>
+        createNeatlogsMastraObservability(provider, {
+          _observabilityModule: {},
+        }),
+      ).toThrow('@mastra/observability does not export a valid Observability constructor');
+    });
+
+    it('should throw when Observability is not a function', () => {
+      expect(() =>
+        createNeatlogsMastraObservability(provider, {
+          _observabilityModule: { Observability: 42 },
+        }),
+      ).toThrow('@mastra/observability does not export a valid Observability constructor');
+    });
+
+    it('should route exported spans to the provided tracerProvider', async () => {
+      const result = createNeatlogsMastraObservability(provider, {
+        _observabilityModule: mockObsModule,
+      });
+
+      // Send a span through the exporter
+      await result.exporter.exportTracingEvent(makeEvent(makeSpan({
+        type: 'agent_run',
+        name: 'helper.test.agent',
+      })));
+
+      // Verify the provider's tracer was used
+      const tracer = (provider.getTracer as any).mock.results[0]?.value;
+      expect(tracer.startSpan).toHaveBeenCalledWith(
+        'helper.test.agent',
+        expect.any(Object),
+        expect.anything(),
+      );
+      expect(mockSpan.setAttribute).toHaveBeenCalledWith('openinference.span.kind', 'AGENT');
+      expect(mockSpan.end).toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Export shape test
+  // -------------------------------------------------------------------------
+
+  describe('export shape', () => {
+    it('should export all public API from index', async () => {
+      const mod = await import('../src/index.js');
+      // Default export is the instrumentor class
+      expect(typeof mod.default).toBe('function');
+      expect(mod.default).toBe(MastraInstrumentor);
+      // Named exports
+      expect(typeof mod.MastraInstrumentor).toBe('function');
+      expect(typeof mod.NeatlogsMastraExporter).toBe('function');
+      expect(typeof mod.createNeatlogsMastraObservability).toBe('function');
+      // Instrumentor has an instrument() method
+      const inst = new mod.MastraInstrumentor();
+      expect(typeof inst.instrument).toBe('function');
+    });
+  });
+
+  // NOTE: ESM namespace objects (from dynamic import()) are frozen/read-only,
+  // so monkey-patching `Mastra` on a true ESM namespace is not possible.
+  // The instrumentation uses require() (CJS) to obtain a mutable exports
+  // object.  When the export descriptor is non-configurable (e.g. CJS
+  // re-exports of ESM), _patchMastraConstructor detects this and bails out.
+
+  // -------------------------------------------------------------------------
+  // Non-configurable export descriptor handling
+  // -------------------------------------------------------------------------
+
+  describe('non-configurable export descriptor', () => {
+    it('should bail out gracefully when Mastra export has a non-configurable getter', () => {
+      const nonConfigModule: any = {};
+      Object.defineProperty(nonConfigModule, 'Mastra', {
+        get: () => mockModule.Mastra,
+        configurable: false,
+      });
+
+      instrumentor.instrument({
+        tracerProvider: provider,
+        _module: nonConfigModule,
+        _observabilityModule: mockObsModule,
+      });
+
+      // The original constructor should still be in place — patch was skipped
+      expect(nonConfigModule.Mastra).toBe(mockModule.Mastra);
+    });
+
+    it('should bail out when assignment silently no-ops (non-writable)', () => {
+      const nonWritableModule: any = {};
+      Object.defineProperty(nonWritableModule, 'Mastra', {
+        value: mockModule.Mastra,
+        writable: false,
+        configurable: false,
+      });
+
+      instrumentor.instrument({
+        tracerProvider: provider,
+        _module: nonWritableModule,
+        _observabilityModule: mockObsModule,
+      });
+
+      // The original constructor should still be in place
+      expect(nonWritableModule.Mastra).toBe(mockModule.Mastra);
+    });
+
+    it('should bail out and warn when export is non-configurable but writable (sealed CJS bundle case)', () => {
+      // This reproduces the real @mastra/core@1.25.x case: configurable:false,
+      // writable:true, no getter.  The old guard (!desc.configurable && (desc.get
+      // || !desc.writable)) evaluated to false here and fell through to the
+      // assignment, which throws in strict mode (CJS strict) — leaving the
+      // module unpatched with no user-visible warning.
+      const sealedModule: any = {};
+      Object.defineProperty(sealedModule, 'Mastra', {
+        value: mockModule.Mastra,
+        writable: true,
+        configurable: false,
+      });
+
+      const warnSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+      instrumentor.instrument({
+        tracerProvider: provider,
+        _module: sealedModule,
+        _observabilityModule: mockObsModule,
+      });
+
+      // The original constructor should still be in place — patch was skipped
+      expect(sealedModule.Mastra).toBe(mockModule.Mastra);
+
+      // A user-visible warning must have been emitted
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('[neatlogs] Cannot patch @mastra/core'),
+      );
+
+      warnSpy.mockRestore();
     });
   });
 
@@ -491,11 +767,44 @@ describe('MastraInstrumentor', () => {
     });
 
     it('should allow re-instrumentation after disable', () => {
-      instrumentor.instrument({ tracerProvider: provider, _module: mockModule });
+      instrumentor.instrument({
+        tracerProvider: provider,
+        _module: mockModule,
+        _observabilityModule: mockObsModule,
+      });
       instrumentor.disable();
       expect(() =>
-        instrumentor.instrument({ tracerProvider: provider, _module: mockModule }),
+        instrumentor.instrument({
+          tracerProvider: provider,
+          _module: mockModule,
+          _observabilityModule: mockObsModule,
+        }),
       ).not.toThrow();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // @mastra/observability warning
+  // -------------------------------------------------------------------------
+
+  describe('@mastra/observability warning', () => {
+    it('should emit a warning when observability module is unavailable', () => {
+      const writeSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+      instrumentor.instrument({
+        tracerProvider: provider,
+        _module: mockModule,
+        _observabilityModule: {}, // No Observability export
+      });
+
+      // Trigger the Mastra constructor which tries to create observability
+      new (mockModule.Mastra as any)({});
+
+      expect(writeSpy).toHaveBeenCalledWith(
+        expect.stringContaining('[neatlogs] Mastra instrumentation could not activate'),
+      );
+
+      writeSpy.mockRestore();
     });
   });
 });
