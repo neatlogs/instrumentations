@@ -97,12 +97,23 @@ export class GoogleGenAIInstrumentation extends InstrumentationBase<GoogleGenAII
   }
 
   /**
+   * Eagerly patch a pre-loaded @google/genai module.
+   * Call this after enable() with the resolved module to handle ESM dynamic
+   * imports where OTel module hooks don't fire.
+   */
+  patchEager(moduleExports: any): boolean {
+    if (this._modelsProto) return true;
+    this._patchModule(moduleExports);
+    return this._modelsProto !== null;
+  }
+
+  /**
    * Set common request attributes on a span (shared between generate and stream).
    */
   private _setCommonRequestAttributes(
     span: Span,
     model: string,
-    contents: any[],
+    contents: any,
     request: any,
   ): void {
     span.setAttribute('openinference.span.kind', 'LLM');
@@ -125,6 +136,14 @@ export class GoogleGenAIInstrumentation extends InstrumentationBase<GoogleGenAII
       }
       if (config.topK !== undefined) {
         span.setAttribute('gen_ai.request.top_k', config.topK);
+      }
+      if (config.systemInstruction) {
+        const sysText = typeof config.systemInstruction === 'string'
+          ? config.systemInstruction
+          : config.systemInstruction?.parts?.map((p: any) => p.text).join('') ?? '';
+        if (sysText) {
+          span.setAttribute('llm.system', sysText);
+        }
       }
     }
   }

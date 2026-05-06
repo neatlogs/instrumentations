@@ -34,10 +34,20 @@ export function extractTextFromParts(parts: any[]): string {
  * Iterates over the contents array and sets role + content for each message.
  * Best-effort: errors are silently caught.
  */
-export function setInputMessageAttributes(span: Span, contents: any[]): void {
+export function setInputMessageAttributes(span: Span, contents: any): void {
   try {
+    if (typeof contents === 'string') {
+      span.setAttribute('llm.input_messages.0.message.role', 'user');
+      span.setAttribute('llm.input_messages.0.message.content', contents);
+      return;
+    }
     if (!Array.isArray(contents)) return;
     contents.forEach((content, i) => {
+      if (typeof content === 'string') {
+        span.setAttribute(`llm.input_messages.${i}.message.role`, 'user');
+        span.setAttribute(`llm.input_messages.${i}.message.content`, content);
+        return;
+      }
       const role = content.role || 'user';
       span.setAttribute(`llm.input_messages.${i}.message.role`, role);
       if (content.parts) {
@@ -101,9 +111,15 @@ export function setOutputAttributes(span: Span, result: any): void {
         span.setAttribute('llm.token_count.total', usage.totalTokenCount);
       }
     }
-    span.setAttribute('output.value', safeJsonStringify(result));
-  } catch {
-    // Best-effort
+    // Set output.value to meaningful response content only (exclude sdk_http_response headers).
+    // Mirrors Python OI which uses model_dump_json(exclude_unset=True) on the Pydantic response.
+    const cleanResult: Record<string, unknown> = {};
+    if (result.candidates) cleanResult.candidates = result.candidates;
+    if (result.usageMetadata) cleanResult.usageMetadata = result.usageMetadata;
+    if (result.modelVersion) cleanResult.modelVersion = result.modelVersion;
+    span.setAttribute('output.value', safeJsonStringify(cleanResult));
+  } catch (error) {
+    span.setAttribute('output.value', `Error extracting output: ${error}`);
   }
 }
 
