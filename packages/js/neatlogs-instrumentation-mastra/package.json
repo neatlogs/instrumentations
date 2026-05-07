@@ -1,6 +1,6 @@
 {
   "name": "@neatlogs/instrumentation-mastra",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Neatlogs instrumentation for Mastra AI framework (@mastra/core)",
   "main": "./dist/cjs/index.js",
   "module": "./dist/esm/index.js",
@@ -48,7 +48,7 @@
   },
   "peerDependencies": {
     "@mastra/core": ">=1.0.0",
-    "@mastra/observability": ">=1.0.0 <1.6.0"
+    "@mastra/observability": ">=1.0.0"
   },
   "peerDependenciesMeta": {
     "@mastra/core": {
@@ -60,7 +60,7 @@
   },
   "devDependencies": {
     "@mastra/core": "1.25.0",
-    "@mastra/observability": ">=1.0.0 <1.6.0",
+    "@mastra/observability": ">=1.0.0",
     "@opentelemetry/sdk-trace-base": "^1.30.0",
     "@opentelemetry/sdk-trace-node": "^1.30.0",
     "neatlogs": "file:/code/neatlogs/neatlogs-typescript",

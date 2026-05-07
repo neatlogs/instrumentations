@@ -1,6 +1,6 @@
 {
   "name": "@neatlogs/instrumentation-google-genai",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "OpenTelemetry instrumentation for @google/genai (Google GenAI SDK)",
   "main": "./dist/cjs/index.js",
   "module": "./dist/esm/index.js",
@@ -17,7 +17,11 @@
       }
     }
   },
-  "files": ["dist/", "README.md", "LICENSE"],
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "npm run build:esm && npm run build:cjs",
     "build:esm": "tsc -p tsconfig.esm.json",
@@ -27,7 +31,15 @@
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit"
   },
-  "keywords": ["opentelemetry", "instrumentation", "google", "genai", "gemini", "neatlogs", "tracing"],
+  "keywords": [
+    "opentelemetry",
+    "instrumentation",
+    "google",
+    "genai",
+    "gemini",
+    "neatlogs",
+    "tracing"
+  ],
   "license": "MIT",
   "dependencies": {
     "@opentelemetry/api": "^1.9.0",
