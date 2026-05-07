@@ -123,6 +123,12 @@ export class GoogleGenAIInstrumentation extends InstrumentationBase<GoogleGenAII
 
     setInputMessageAttributes(span, contents);
 
+    if (typeof contents === 'string') {
+      span.setAttribute('input.value', contents);
+    } else if (Array.isArray(contents)) {
+      span.setAttribute('input.value', JSON.stringify(contents));
+    }
+
     if (request.config) {
       const config = request.config;
       if (config.temperature !== undefined) {

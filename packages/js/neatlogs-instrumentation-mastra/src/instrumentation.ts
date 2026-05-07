@@ -33,9 +33,9 @@ import {
 
 const SPAN_TYPE_TO_OI_KIND: Record<string, string> = {
   // LLM spans
-  model_generation: 'LLM',
+  model_generation: 'CHAIN',
   model_step: 'LLM',
-  model_chunk: 'LLM',
+  model_chunk: 'CHAIN',
   // Tool spans
   tool_call: 'TOOL',
   mcp_tool_call: 'TOOL',
@@ -182,7 +182,10 @@ export class NeatlogsMastraBridge {
    * Active spans keyed by OTel span ID (which equals Mastra span ID since
    * createSpan returns the OTel-generated IDs back to Mastra).
    */
-  private _activeSpans: Map<string, { span: Span; context: Context }> = new Map();
+  private _activeSpans: Map<string, { span: Span; context: Context; parentSpanId?: string }> = new Map();
+
+  /** Model metadata inherited down from model_generation spans to their descendants. */
+  private _modelInfo: Map<string, { model?: string; provider?: string }> = new Map();
 
   constructor(tracerProvider: TracerProvider) {
     this._tracer = tracerProvider.getTracer('openinference.instrumentation.mastra');
@@ -223,7 +226,6 @@ export class NeatlogsMastraBridge {
 
       // Store with context that has this span as active
       const spanContext = trace.setSpan(parentContext, otelSpan);
-      this._activeSpans.set(spanId, { span: otelSpan, context: spanContext });
 
       // Determine parentSpanId from parent context
       const parentSpan = trace.getSpan(parentContext);
@@ -231,6 +233,17 @@ export class NeatlogsMastraBridge {
       const parentSpanId = parentSpanCtx && isSpanContextValid(parentSpanCtx)
         ? parentSpanCtx.spanId
         : undefined;
+
+      this._activeSpans.set(spanId, { span: otelSpan, context: spanContext, parentSpanId });
+
+      // Store model info at creation time for model_generation spans
+      if (options.type === 'model_generation') {
+        const model = options.attributes?.model ?? this._extractModelFromName(options.name);
+        const provider = options.attributes?.provider;
+        if (model || provider) {
+          this._modelInfo.set(spanId, { model, provider });
+        }
+      }
 
       return { traceId, spanId, parentSpanId };
     } catch {
@@ -282,15 +295,17 @@ export class NeatlogsMastraBridge {
     if (!entry) return;
 
     this._activeSpans.delete(mastraSpan.id);
-    this._finalizeSpan(entry.span, mastraSpan);
+    this._modelInfo.delete(mastraSpan.id);
+    this._finalizeSpan(entry.span, mastraSpan, entry.parentSpanId);
   }
 
   // -------------------------------------------------------------------------
   // Shared finalization (attributes, status, end)
   // -------------------------------------------------------------------------
 
-  private _finalizeSpan(otelSpan: Span, mastraSpan: any): void {
-    const oiKind = getOiKind(mastraSpan.type ?? 'generic');
+  private _finalizeSpan(otelSpan: Span, mastraSpan: any, parentSpanId?: string): void {
+    const type = mastraSpan.type ?? 'generic';
+    const oiKind = getOiKind(type);
 
     otelSpan.setAttribute('openinference.span.kind', oiKind);
 
@@ -301,7 +316,35 @@ export class NeatlogsMastraBridge {
       otelSpan.setAttribute('mastra.entity.type', mastraSpan.entityType);
     }
 
-    this._setTypeAttributes(otelSpan, mastraSpan);
+    // Store/update model info from model_generation spans for descendant inheritance
+    const attrs = mastraSpan.attributes ?? {};
+    if (type === 'model_generation' && (attrs.model || attrs.responseModel || attrs.provider || attrs.metadata || mastraSpan.metadata)) {
+      let model = attrs.responseModel;
+      if (!model) {
+        const metaSources = [mastraSpan.metadata, attrs.metadata];
+        for (const raw of metaSources) {
+          if (!raw) continue;
+          try {
+            const meta = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            if (meta?.body?.model) { model = meta.body.model; break; }
+          } catch (e: unknown) {
+            console.warn('[neatlogs-mastra] Failed to parse metadata for model inheritance:', e);
+          }
+        }
+      }
+      model = model ?? attrs.model;
+      this._modelInfo.set(mastraSpan.id, { model, provider: attrs.provider });
+    }
+
+    // Set chunk type as attribute for UI context
+    if (type === 'model_chunk') {
+      const chunkType = mastraSpan.attributes?.chunkType;
+      if (chunkType) {
+        otelSpan.setAttribute('mastra.chunk.type', chunkType);
+      }
+    }
+
+    this._setTypeAttributes(otelSpan, mastraSpan, parentSpanId);
     this._setInputOutput(otelSpan, mastraSpan);
 
     if (mastraSpan.errorInfo) {
@@ -338,6 +381,27 @@ export class NeatlogsMastraBridge {
   // Helpers
   // -------------------------------------------------------------------------
 
+  /** Walk up the parent chain to find the nearest ancestor with model info. */
+  private _resolveModelInfo(spanId?: string): { model?: string; provider?: string } | undefined {
+    let current = spanId;
+    const visited = new Set<string>();
+    while (current && !visited.has(current)) {
+      visited.add(current);
+      const info = this._modelInfo.get(current);
+      if (info) return info;
+      const entry = this._activeSpans.get(current);
+      current = entry?.parentSpanId;
+    }
+    return undefined;
+  }
+
+  /** Extract model name from span names like "llm: 'gpt-5-nano'" */
+  private _extractModelFromName(name?: string): string | undefined {
+    if (!name) return undefined;
+    const match = name.match(/^llm:\s*'([^']+)'/);
+    return match?.[1];
+  }
+
   private _getExternalParentId(options: any): string | undefined {
     if (!options.parent) return undefined;
     if (options.parent.isInternal) {
@@ -351,55 +415,87 @@ export class NeatlogsMastraBridge {
     return this._activeSpans.size;
   }
 
-  private _setTypeAttributes(otelSpan: any, span: any): void {
+  private _setTypeAttributes(otelSpan: any, span: any, parentSpanId?: string): void {
     const attrs = span.attributes ?? {};
     const type = span.type ?? '';
 
     if (type === 'model_generation' || type === 'model_step') {
+      // Extract the actual model name from the API response metadata.
+      // Mastra puts response metadata in span.metadata (top-level), which contains
+      // the response body with the resolved model name (e.g., "gpt-5-nano-2025-08-07"
+      // instead of the deployment name "gpt-5-nano").
+      let responseModel = attrs.responseModel;
+      if (!responseModel) {
+        const metaSources = [span.metadata, attrs.metadata];
+        for (const raw of metaSources) {
+          if (!raw) continue;
+          try {
+            const meta = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            if (meta?.body?.model) { responseModel = meta.body.model; break; }
+          } catch (e: unknown) {
+            console.warn('[neatlogs-mastra] Failed to parse metadata for model extraction:', e);
+          }
+        }
+      }
+
+      const inherited = this._resolveModelInfo(parentSpanId);
+      const resolvedModel = responseModel ?? inherited?.model ?? attrs.model;
+      const provider = attrs.provider ?? inherited?.provider;
+
       if (attrs.model) {
-        otelSpan.setAttribute('llm.model_name', attrs.model);
         otelSpan.setAttribute('gen_ai.request.model', attrs.model);
       }
-      if (attrs.responseModel) {
-        otelSpan.setAttribute('gen_ai.response.model', attrs.responseModel);
+      if (resolvedModel) {
+        otelSpan.setAttribute('llm.model_name', resolvedModel);
       }
-      if (attrs.provider) {
-        otelSpan.setAttribute('gen_ai.system', attrs.provider);
-        otelSpan.setAttribute('llm.provider', attrs.provider);
+      if (responseModel) {
+        otelSpan.setAttribute('gen_ai.response.model', responseModel);
+      } else if (inherited?.model) {
+        otelSpan.setAttribute('gen_ai.response.model', inherited.model);
+      }
+      if (provider) {
+        otelSpan.setAttribute('gen_ai.system', provider);
+        otelSpan.setAttribute('llm.provider', provider);
       }
       if (attrs.finishReason) {
         otelSpan.setAttribute('llm.response.finish_reason', attrs.finishReason);
       }
-      const usage = attrs.usage;
-      if (usage) {
-        if (usage.inputTokens !== undefined) {
-          otelSpan.setAttribute('llm.token_count.prompt', usage.inputTokens);
-        }
-        if (usage.outputTokens !== undefined) {
-          otelSpan.setAttribute('llm.token_count.completion', usage.outputTokens);
-        }
-        if (usage.inputTokens !== undefined && usage.outputTokens !== undefined) {
-          otelSpan.setAttribute('llm.token_count.total', usage.inputTokens + usage.outputTokens);
-        }
-        const inputDetails = usage.inputDetails;
-        if (inputDetails) {
-          if (inputDetails.cacheRead !== undefined) {
-            otelSpan.setAttribute('llm.token_count.prompt_details.cache_read', inputDetails.cacheRead);
+      // Only emit token counts on model_step (per-call canonical spans).
+      // model_generation carries the aggregated total across all steps — emitting
+      // it would cause double-counting in cost calculation since the backend sums
+      // tokens from all LLM spans in a trace.
+      if (type === 'model_step') {
+        const usage = attrs.usage;
+        if (usage) {
+          if (usage.inputTokens !== undefined) {
+            otelSpan.setAttribute('llm.token_count.prompt', usage.inputTokens);
           }
-          if (inputDetails.cacheWrite !== undefined) {
-            otelSpan.setAttribute('llm.token_count.prompt_details.cache_write', inputDetails.cacheWrite);
+          if (usage.outputTokens !== undefined) {
+            otelSpan.setAttribute('llm.token_count.completion', usage.outputTokens);
           }
-          if (inputDetails.audio !== undefined) {
-            otelSpan.setAttribute('llm.token_count.prompt_details.audio', inputDetails.audio);
+          if (usage.inputTokens !== undefined && usage.outputTokens !== undefined) {
+            otelSpan.setAttribute('llm.token_count.total', usage.inputTokens + usage.outputTokens);
           }
-        }
-        const outputDetails = usage.outputDetails;
-        if (outputDetails) {
-          if (outputDetails.reasoning !== undefined) {
-            otelSpan.setAttribute('llm.token_count.completion_details.reasoning', outputDetails.reasoning);
+          const inputDetails = usage.inputDetails;
+          if (inputDetails) {
+            if (inputDetails.cacheRead !== undefined) {
+              otelSpan.setAttribute('llm.token_count.prompt_details.cache_read', inputDetails.cacheRead);
+            }
+            if (inputDetails.cacheWrite !== undefined) {
+              otelSpan.setAttribute('llm.token_count.prompt_details.cache_write', inputDetails.cacheWrite);
+            }
+            if (inputDetails.audio !== undefined) {
+              otelSpan.setAttribute('llm.token_count.prompt_details.audio', inputDetails.audio);
+            }
           }
-          if (outputDetails.audio !== undefined) {
-            otelSpan.setAttribute('llm.token_count.completion_details.audio', outputDetails.audio);
+          const outputDetails = usage.outputDetails;
+          if (outputDetails) {
+            if (outputDetails.reasoning !== undefined) {
+              otelSpan.setAttribute('llm.token_count.completion_details.reasoning', outputDetails.reasoning);
+            }
+            if (outputDetails.audio !== undefined) {
+              otelSpan.setAttribute('llm.token_count.completion_details.audio', outputDetails.audio);
+            }
           }
         }
       }
@@ -460,15 +556,18 @@ export class NeatlogsMastraBridge {
 
   private _setInputOutput(otelSpan: any, span: any): void {
     const type = span.type ?? '';
-    const isLlmSpan = type === 'model_generation' || type === 'model_step';
+    const hasStructuredMessages = type === 'model_generation' || type === 'model_step';
 
-    if (isLlmSpan) {
-      if (Array.isArray(span.input) && span.input.length > 0) {
-        flattenMessages(span.input, 'llm.input_messages', (k, v) =>
+    if (hasStructuredMessages) {
+      const input = type === 'model_generation' && span.input?.messages
+        ? span.input.messages
+        : span.input;
+      if (Array.isArray(input) && input.length > 0) {
+        flattenMessages(input, 'llm.input_messages', (k, v) =>
           otelSpan.setAttribute(k, v),
         );
-      } else if (span.input !== undefined && span.input !== null) {
-        otelSpan.setAttribute('input.value', _safeStringify(span.input));
+      } else if (input !== undefined && input !== null) {
+        otelSpan.setAttribute('input.value', _safeStringify(input));
       }
 
       if (Array.isArray(span.output) && span.output.length > 0) {
@@ -479,11 +578,41 @@ export class NeatlogsMastraBridge {
         otelSpan.setAttribute('output.value', _safeStringify(span.output));
       }
     } else {
+      const isTool = type === 'tool_call' || type === 'mcp_tool_call';
+      const oiKind = getOiKind(type);
       if (span.input !== undefined && span.input !== null) {
-        otelSpan.setAttribute('input.value', _safeStringify(span.input));
+        const inputStr = _safeStringify(span.input);
+        otelSpan.setAttribute('input.value', inputStr);
+        if (isTool) {
+          otelSpan.setAttribute('tool.input', inputStr);
+          otelSpan.setAttribute('neatlogs.tool.input', inputStr);
+        } else if (oiKind === 'CHAIN') {
+          otelSpan.setAttribute('chain.input', inputStr);
+          otelSpan.setAttribute('neatlogs.chain.input', inputStr);
+        } else if (oiKind === 'WORKFLOW') {
+          otelSpan.setAttribute('workflow.input', inputStr);
+          otelSpan.setAttribute('neatlogs.workflow.input', inputStr);
+        } else if (oiKind === 'AGENT') {
+          otelSpan.setAttribute('agent.input', inputStr);
+          otelSpan.setAttribute('neatlogs.agent.input', inputStr);
+        }
       }
       if (span.output !== undefined && span.output !== null) {
-        otelSpan.setAttribute('output.value', _safeStringify(span.output));
+        const outputStr = _safeStringify(span.output);
+        otelSpan.setAttribute('output.value', outputStr);
+        if (isTool) {
+          otelSpan.setAttribute('tool.output', outputStr);
+          otelSpan.setAttribute('neatlogs.tool.output', outputStr);
+        } else if (oiKind === 'CHAIN') {
+          otelSpan.setAttribute('chain.output', outputStr);
+          otelSpan.setAttribute('neatlogs.chain.output', outputStr);
+        } else if (oiKind === 'WORKFLOW') {
+          otelSpan.setAttribute('workflow.output', outputStr);
+          otelSpan.setAttribute('neatlogs.workflow.output', outputStr);
+        } else if (oiKind === 'AGENT') {
+          otelSpan.setAttribute('agent.output', outputStr);
+          otelSpan.setAttribute('neatlogs.agent.output', outputStr);
+        }
       }
     }
   }
