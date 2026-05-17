@@ -1,21 +1,18 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { trace, SpanStatusCode } from '@opentelemetry/api';
-import {
-  BasicTracerProvider,
-  SimpleSpanProcessor,
-  InMemorySpanExporter,
-} from '@opentelemetry/sdk-trace-base';
+import { trace, SpanStatusCode, context } from '@opentelemetry/api';
+import { SimpleSpanProcessor, InMemorySpanExporter } from '@opentelemetry/sdk-trace-base';
+import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { wrapAISDK } from '../src/wrap.js';
 
 describe('wrapAISDK', () => {
   let exporter: InMemorySpanExporter;
-  let provider: BasicTracerProvider;
+  let provider: NodeTracerProvider;
 
   beforeEach(() => {
     exporter = new InMemorySpanExporter();
-    provider = new BasicTracerProvider();
+    provider = new NodeTracerProvider();
     provider.addSpanProcessor(new SimpleSpanProcessor(exporter));
-    trace.setGlobalTracerProvider(provider);
+    provider.register();
   });
 
   afterEach(async () => {
@@ -135,5 +132,37 @@ describe('wrapAISDK', () => {
     expect((wrapped as any).irrelevant).toBe('noop');
     // no spans because nothing was called
     expect(exporter.getFinishedSpans().length).toBe(0);
+  });
+
+  it('makes child spans nest under the parent (active context)', async () => {
+    // Simulates what the AI SDK does internally: opens its own span
+    // using the active tracer. With startActiveSpan, our wrapper sets
+    // the parent context so this child correctly nests.
+    const fakeAi = {
+      generateText: async (_opts: any) => {
+        const childTracer = trace.getTracer('fake-ai-internal');
+        // When using startSpan with the active context, it inherits the parent
+        const childSpan = childTracer.startSpan('ai.doGenerate', {}, context.active());
+        childSpan.end();
+        return { text: 'ok' };
+      },
+    };
+    const wrapped = wrapAISDK(fakeAi as any);
+    await wrapped.generateText({ model: 'fake', prompt: 'hi' });
+
+    const spans = exporter.getFinishedSpans();
+    // Two spans: parent ai.generateText + child ai.doGenerate
+    expect(spans.length).toBe(2);
+
+    const parent = spans.find((s) => s.name === 'ai.generateText');
+    const child = spans.find((s) => s.name === 'ai.doGenerate');
+    expect(parent).toBeDefined();
+    expect(child).toBeDefined();
+
+    // The child must have its parentSpanId set to the parent's spanId
+    // (this is the entire architectural purpose of the wrapper).
+    expect(child!.parentSpanId).toBe(parent!.spanContext().spanId);
+    // And both should share the same trace ID
+    expect(child!.spanContext().traceId).toBe(parent!.spanContext().traceId);
   });
 });

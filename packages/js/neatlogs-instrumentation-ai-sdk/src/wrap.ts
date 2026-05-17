@@ -56,21 +56,24 @@ function createAsyncWrapper(
 ): (opts: any) => Promise<unknown> {
   return async function wrappedAsyncFn(opts: any): Promise<unknown> {
     const tracer = trace.getTracer(TRACER_NAME);
-    // Manual span management for async operations — startActiveSpan doesn't work
-    // reliably with promises in the callback (spans don't get exported in tests).
-    const span = tracer.startSpan(`ai.${name}`, { attributes: { 'openinference.span.kind': 'LLM' } });
-    try {
-      setInputValue(span, opts);
-      const merged = mergeTelemetry(opts);
-      const result = await original(merged);
-      setOutputValue(span, result);
-      return result;
-    } catch (err) {
-      recordSpanError(span, err);
-      throw err;
-    } finally {
-      span.end();
-    }
+    return tracer.startActiveSpan(
+      `ai.${name}`,
+      { attributes: { 'openinference.span.kind': 'LLM' } },
+      async (span) => {
+        try {
+          setInputValue(span, opts);
+          const merged = mergeTelemetry(opts);
+          const result = await original(merged);
+          setOutputValue(span, result);
+          return result;
+        } catch (err) {
+          recordSpanError(span, err);
+          throw err;
+        } finally {
+          span.end();
+        }
+      },
+    );
   };
 }
 
