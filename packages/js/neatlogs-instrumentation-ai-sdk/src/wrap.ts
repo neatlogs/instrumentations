@@ -23,8 +23,16 @@ const WRAPPED_FUNCTIONS: readonly WrappedFunctionName[] = [
  *
  *   1. Opens a parent OTel span on the active TracerProvider.
  *   2. Forces `experimental_telemetry: { isEnabled: true, ... }` for the call,
- *      merging user-supplied metadata.
+ *      merging user-supplied metadata. **Any user-supplied `isEnabled: false`
+ *      is overridden** — the wrapper exists to enable tracing. To skip
+ *      telemetry for a specific call, use the unwrapped `ai` import directly.
  *   3. Records input/output on the parent span and propagates errors.
+ *
+ * Streaming functions (`streamText`, `streamObject`) capture `input.value` on
+ * the parent span but **not** `output.value`, since the result is a stream
+ * object that cannot be JSON-serialized. Native AI SDK child spans share the
+ * same trace ID, so streaming traces still group correctly even though the
+ * parent's output attribute is unset.
  *
  * Other exports (Agent, Experimental_Agent, helpers, types) are passed through
  * unchanged in this version. Agent wrapping lands in a follow-up.
@@ -118,10 +126,11 @@ function mergeTelemetry(opts: any): any {
   return {
     ...opts,
     experimental_telemetry: {
+      // User config first; baseTelemetry then overrides isEnabled/recordInputs/
+      // recordOutputs/tracer/metadata. createAITelemetry already merged user
+      // metadata with neatlogsWrapped: true, so the spread is the final word.
       ...opts?.experimental_telemetry,
       ...baseTelemetry,
-      // mergeTelemetry must always end with our base values — spread again to win
-      metadata: baseTelemetry.metadata,
     },
   };
 }

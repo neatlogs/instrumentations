@@ -80,7 +80,7 @@ The Vercel AI SDK emits attributes under the `ai.*` namespace; the Neatlogs SDK'
 | `ai.usage.completionTokens` | `neatlogs.llm.token_count.completion` |
 | `ai.prompt.messages` | `neatlogs.llm.input_messages.{i}.{role,content}` |
 | `ai.response.text` | `neatlogs.llm.output_messages.0.content` |
-| `ai.response.toolCalls` | `neatlogs.llm.output_messages.0.tool_calls.{i}.*` |
+| `ai.response.toolCalls` | `neatlogs.llm.tool_calls.{i}.{name,arguments,id}` |
 | `ai.toolCall.name` / `args` / `result` | `tool.name` / `input.value` / `output.value` |
 
 ## Compatibility
