@@ -165,4 +165,43 @@ describe('wrapAISDK', () => {
     // And both should share the same trace ID
     expect(child!.spanContext().traceId).toBe(parent!.spanContext().traceId);
   });
+
+  it('wraps generateObject and captures object output', async () => {
+    const fakeAi = {
+      generateObject: async (opts: any) => {
+        // assert experimental_telemetry was injected on the wrapped call too
+        expect(opts.experimental_telemetry?.isEnabled).toBe(true);
+        return { object: { city: 'Paris' } };
+      },
+    };
+    const wrapped = wrapAISDK(fakeAi as any);
+    const result = await wrapped.generateObject({ model: 'fake', schema: {} });
+    expect(result.object).toEqual({ city: 'Paris' });
+
+    const spans = exporter.getFinishedSpans();
+    expect(spans.length).toBe(1);
+    expect(spans[0].name).toBe('ai.generateObject');
+    expect(spans[0].attributes['openinference.span.kind']).toBe('LLM');
+    const outputJson = spans[0].attributes['output.value'] as string;
+    expect(JSON.parse(outputJson)).toEqual({ object: { city: 'Paris' } });
+  });
+
+  it('wraps streamObject and returns the stream synchronously', () => {
+    const fakeStream = { partialObjectStream: [{ partial: 1 }, { partial: 2 }] };
+    const fakeAi = {
+      streamObject: (opts: any) => {
+        expect(opts.experimental_telemetry?.isEnabled).toBe(true);
+        return fakeStream;
+      },
+    };
+    const wrapped = wrapAISDK(fakeAi as any);
+    const result = wrapped.streamObject({ model: 'fake', schema: {} });
+    // Sync return — must be the same object reference
+    expect(result).toBe(fakeStream);
+
+    const spans = exporter.getFinishedSpans();
+    expect(spans.length).toBe(1);
+    expect(spans[0].name).toBe('ai.streamObject');
+    expect(spans[0].attributes['openinference.span.kind']).toBe('LLM');
+  });
 });
