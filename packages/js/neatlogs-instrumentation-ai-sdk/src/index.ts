@@ -1,2 +1,2 @@
-// Public API exports — implementations land in subsequent tasks.
-export const __scaffolded = true;
+export { createAITelemetry } from './telemetry.js';
+export type { AITelemetryConfig, CreateAITelemetryOptions } from './telemetry.js';
