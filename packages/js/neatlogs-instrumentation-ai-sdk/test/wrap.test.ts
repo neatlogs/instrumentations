@@ -52,7 +52,7 @@ describe('wrapAISDK', () => {
     const spans = exporter.getFinishedSpans();
     expect(spans.length).toBe(1);
     expect(spans[0].name).toBe('ai.generateText');
-    expect(spans[0].attributes['openinference.span.kind']).toBe('LLM');
+    expect(spans[0].attributes['openinference.span.kind']).toBe('WORKFLOW');
     expect(spans[0].status.code).toBe(SpanStatusCode.UNSET);
   });
 
@@ -181,7 +181,7 @@ describe('wrapAISDK', () => {
     const spans = exporter.getFinishedSpans();
     expect(spans.length).toBe(1);
     expect(spans[0].name).toBe('ai.generateObject');
-    expect(spans[0].attributes['openinference.span.kind']).toBe('LLM');
+    expect(spans[0].attributes['openinference.span.kind']).toBe('WORKFLOW');
     const outputJson = spans[0].attributes['output.value'] as string;
     expect(JSON.parse(outputJson)).toEqual({ object: { city: 'Paris' } });
   });
@@ -202,6 +202,6 @@ describe('wrapAISDK', () => {
     const spans = exporter.getFinishedSpans();
     expect(spans.length).toBe(1);
     expect(spans[0].name).toBe('ai.streamObject');
-    expect(spans[0].attributes['openinference.span.kind']).toBe('LLM');
+    expect(spans[0].attributes['openinference.span.kind']).toBe('WORKFLOW');
   });
 });

@@ -66,7 +66,7 @@ function createAsyncWrapper(
     const tracer = trace.getTracer(TRACER_NAME);
     return tracer.startActiveSpan(
       `ai.${name}`,
-      { attributes: { 'openinference.span.kind': 'LLM' } },
+      { attributes: { 'openinference.span.kind': 'WORKFLOW' } },
       async (span) => {
         try {
           setInputValue(span, opts);
@@ -98,7 +98,7 @@ function createSyncWrapper(
 ): (opts: any) => unknown {
   return function wrappedSyncFn(opts: any): unknown {
     const tracer = trace.getTracer(TRACER_NAME);
-    return tracer.startActiveSpan(`ai.${name}`, { attributes: { 'openinference.span.kind': 'LLM' } }, (span) => {
+    return tracer.startActiveSpan(`ai.${name}`, { attributes: { 'openinference.span.kind': 'WORKFLOW' } }, (span) => {
       try {
         setInputValue(span, opts);
         const merged = mergeTelemetry(opts);
