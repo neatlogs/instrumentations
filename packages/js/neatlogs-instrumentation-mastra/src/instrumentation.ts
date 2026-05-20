@@ -35,6 +35,7 @@ const SPAN_TYPE_TO_OI_KIND: Record<string, string> = {
   // LLM spans
   model_generation: 'CHAIN',
   model_step: 'LLM',
+  model_inference: 'CHAIN',
   model_chunk: 'CHAIN',
   // Tool spans
   tool_call: 'TOOL',
@@ -187,6 +188,9 @@ export class NeatlogsMastraBridge {
   /** Model metadata inherited down from model_generation spans to their descendants. */
   private _modelInfo: Map<string, { model?: string; provider?: string }> = new Map();
 
+  /** Parameters stored from model_generation/model_inference spans for inheritance by model_step. */
+  private _modelParameters: Map<string, Record<string, any>> = new Map();
+
   constructor(tracerProvider: TracerProvider) {
     this._tracer = tracerProvider.getTracer('openinference.instrumentation.mastra');
   }
@@ -245,6 +249,12 @@ export class NeatlogsMastraBridge {
         }
       }
 
+      // Store parameters at creation time (model_generation and model_inference set them here)
+      const creationParams = options.attributes?.parameters;
+      if (creationParams && typeof creationParams === 'object' && Object.keys(creationParams).length > 0) {
+        this._modelParameters.set(spanId, creationParams);
+      }
+
       return { traceId, spanId, parentSpanId };
     } catch {
       return undefined;
@@ -296,6 +306,7 @@ export class NeatlogsMastraBridge {
 
     this._activeSpans.delete(mastraSpan.id);
     this._modelInfo.delete(mastraSpan.id);
+    this._modelParameters.delete(mastraSpan.id);
     this._finalizeSpan(entry.span, mastraSpan, entry.parentSpanId);
   }
 
@@ -395,6 +406,20 @@ export class NeatlogsMastraBridge {
     return undefined;
   }
 
+  /** Walk up the parent chain to find the nearest ancestor with model parameters. */
+  private _resolveModelParameters(spanId?: string): Record<string, any> | undefined {
+    let current = spanId;
+    const visited = new Set<string>();
+    while (current && !visited.has(current)) {
+      visited.add(current);
+      const params = this._modelParameters.get(current);
+      if (params) return params;
+      const entry = this._activeSpans.get(current);
+      current = entry?.parentSpanId;
+    }
+    return undefined;
+  }
+
   /** Extract model name from span names like "llm: 'gpt-5-nano'" */
   private _extractModelFromName(name?: string): string | undefined {
     if (!name) return undefined;
@@ -419,7 +444,7 @@ export class NeatlogsMastraBridge {
     const attrs = span.attributes ?? {};
     const type = span.type ?? '';
 
-    if (type === 'model_generation' || type === 'model_step') {
+    if (type === 'model_generation' || type === 'model_step' || type === 'model_inference') {
       // Extract the actual model name from the API response metadata.
       // Mastra puts response metadata in span.metadata (top-level), which contains
       // the response body with the resolved model name (e.g., "gpt-5-nano-2025-08-07"
@@ -499,11 +524,21 @@ export class NeatlogsMastraBridge {
           }
         }
       }
-      if (attrs.parameters) {
+      if (attrs.parameters && Object.keys(attrs.parameters).length > 0) {
         try {
           otelSpan.setAttribute('llm.invocation_parameters', JSON.stringify(attrs.parameters));
-        } catch {
-          // best-effort
+          this._modelParameters.set(span.id, attrs.parameters);
+        } catch (e) {
+          _warn(`Failed to set invocation parameters: ${e}`);
+        }
+      } else if (type === 'model_step') {
+        const inherited = this._resolveModelParameters(parentSpanId);
+        if (inherited) {
+          try {
+            otelSpan.setAttribute('llm.invocation_parameters', JSON.stringify(inherited));
+          } catch (e) {
+            _warn(`Failed to set inherited invocation parameters: ${e}`);
+          }
         }
       }
       if (attrs.completionStartTime && span.startTime) {
