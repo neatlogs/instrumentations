@@ -11,7 +11,7 @@
  *   pnpm run verify:grouped
  *
  * Remote export run:
- *   NEATLOGS_API_KEY=... NEATLOGS_ENDPOINT=https://staging-cloud.neatlogs.com pnpm run example:grouped
+ *   NEATLOGS_API_KEY=... NEATLOGS_ENDPOINT=https://ingest.neatlogs.com pnpm run example:grouped
  */
 
 import { init, flush, shutdown } from 'neatlogs';
@@ -133,7 +133,7 @@ async function buildMastra(tracerProvider: TracerProvider) {
 async function main() {
   await init({
     apiKey: process.env.NEATLOGS_API_KEY ?? '',
-    endpoint: process.env.NEATLOGS_ENDPOINT ?? 'https://staging-cloud.neatlogs.com',
+    endpoint: process.env.NEATLOGS_ENDPOINT ?? 'https://ingest.neatlogs.com',
     workflowName,
     tags: ['typescript', 'mastra', 'grouped-example'],
     debug: true,
