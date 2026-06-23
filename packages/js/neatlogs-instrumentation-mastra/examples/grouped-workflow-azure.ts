@@ -168,7 +168,7 @@ async function buildMastra(tracerProvider: TracerProvider) {
 async function main() {
   await init({
     apiKey: process.env.NEATLOGS_API_KEY ?? '',
-    endpoint: process.env.NEATLOGS_ENDPOINT ?? 'https://staging-cloud.neatlogs.com',
+    endpoint: process.env.NEATLOGS_ENDPOINT ?? 'https://ingest.neatlogs.com',
     workflowName,
     tags: ['typescript', 'mastra', 'grouped-example', 'azure-openai', 'real-llm'],
     debug: true,
